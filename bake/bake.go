@@ -14,14 +14,16 @@ import (
 
 	"github.com/docker/buildx/bake/hclparser"
 	"github.com/docker/buildx/build"
+	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/cli/cli/config"
-	"github.com/docker/docker/builder/remotecontext/urlutil"
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/pkg/errors"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 )
 
 var (
@@ -139,19 +141,6 @@ func ReadTargets(ctx context.Context, files []File, targets, overrides []string,
 		}
 	}
 
-	// Propagate SOURCE_DATE_EPOCH from the client env.
-	// The logic is purposely duplicated from `build/build`.go for keeping this visible in `bake --print`.
-	if v := os.Getenv("SOURCE_DATE_EPOCH"); v != "" {
-		for _, f := range m {
-			if f.Args == nil {
-				f.Args = make(map[string]*string)
-			}
-			if _, ok := f.Args["SOURCE_DATE_EPOCH"]; !ok {
-				f.Args["SOURCE_DATE_EPOCH"] = &v
-			}
-		}
-	}
-
 	return m, n, nil
 }
 
@@ -244,13 +233,28 @@ func ParseFiles(files []File, defaults map[string]string) (_ *Config, err error)
 	}
 
 	if len(hclFiles) > 0 {
-		if err := hclparser.Parse(hcl.MergeFiles(hclFiles), hclparser.Opt{
+		renamed, err := hclparser.Parse(hcl.MergeFiles(hclFiles), hclparser.Opt{
 			LookupVar:     os.LookupEnv,
 			Vars:          defaults,
 			ValidateLabel: validateTargetName,
-		}, &c); err.HasErrors() {
+		}, &c)
+		if err.HasErrors() {
 			return nil, err
 		}
+
+		for _, renamed := range renamed {
+			for oldName, newNames := range renamed {
+				newNames = dedupSlice(newNames)
+				if len(newNames) == 1 && oldName == newNames[0] {
+					continue
+				}
+				c.Groups = append(c.Groups, &Group{
+					Name:    oldName,
+					Targets: newNames,
+				})
+			}
+		}
+		c = dedupeConfig(c)
 	}
 
 	return &c, nil
@@ -595,6 +599,11 @@ type Target struct {
 	linked bool
 }
 
+var _ hclparser.WithEvalContexts = &Target{}
+var _ hclparser.WithGetName = &Target{}
+var _ hclparser.WithEvalContexts = &Group{}
+var _ hclparser.WithGetName = &Group{}
+
 func (t *Target) normalize() {
 	t.Attest = removeDupes(t.Attest)
 	t.Tags = removeDupes(t.Tags)
@@ -778,6 +787,114 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 	return nil
 }
 
+func (g *Group) GetEvalContexts(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(hcl.Expression) hcl.Diagnostics) ([]*hcl.EvalContext, error) {
+	content, _, err := block.Body.PartialContent(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{{Name: "matrix"}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := content.Attributes["matrix"]; ok {
+		return nil, errors.Errorf("matrix is not supported for groups")
+	}
+	return []*hcl.EvalContext{ectx}, nil
+}
+
+func (t *Target) GetEvalContexts(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(hcl.Expression) hcl.Diagnostics) ([]*hcl.EvalContext, error) {
+	content, _, err := block.Body.PartialContent(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{{Name: "matrix"}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	attr, ok := content.Attributes["matrix"]
+	if !ok {
+		return []*hcl.EvalContext{ectx}, nil
+	}
+	if diags := loadDeps(attr.Expr); diags.HasErrors() {
+		return nil, diags
+	}
+	value, err := attr.Expr.Value(ectx)
+	if err != nil {
+		return nil, err
+	}
+
+	if !value.Type().IsMapType() && !value.Type().IsObjectType() {
+		return nil, errors.Errorf("matrix must be a map")
+	}
+	matrix := value.AsValueMap()
+
+	ectxs := []*hcl.EvalContext{ectx}
+	for k, expr := range matrix {
+		if !expr.CanIterateElements() {
+			return nil, errors.Errorf("matrix values must be a list")
+		}
+
+		ectxs2 := []*hcl.EvalContext{}
+		for _, v := range expr.AsValueSlice() {
+			for _, e := range ectxs {
+				e2 := ectx.NewChild()
+				e2.Variables = make(map[string]cty.Value)
+				for k, v := range e.Variables {
+					e2.Variables[k] = v
+				}
+				e2.Variables[k] = v
+				ectxs2 = append(ectxs2, e2)
+			}
+		}
+		ectxs = ectxs2
+	}
+	return ectxs, nil
+}
+
+func (g *Group) GetName(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(hcl.Expression) hcl.Diagnostics) (string, error) {
+	content, _, diags := block.Body.PartialContent(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{{Name: "name"}, {Name: "matrix"}},
+	})
+	if diags != nil {
+		return "", diags
+	}
+
+	if _, ok := content.Attributes["name"]; ok {
+		return "", errors.Errorf("name is not supported for groups")
+	}
+	if _, ok := content.Attributes["matrix"]; ok {
+		return "", errors.Errorf("matrix is not supported for groups")
+	}
+	return block.Labels[0], nil
+}
+
+func (t *Target) GetName(ectx *hcl.EvalContext, block *hcl.Block, loadDeps func(hcl.Expression) hcl.Diagnostics) (string, error) {
+	content, _, diags := block.Body.PartialContent(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{{Name: "name"}, {Name: "matrix"}},
+	})
+	if diags != nil {
+		return "", diags
+	}
+
+	attr, ok := content.Attributes["name"]
+	if !ok {
+		return block.Labels[0], nil
+	}
+	if _, ok := content.Attributes["matrix"]; !ok {
+		return "", errors.Errorf("name requires matrix")
+	}
+	if diags := loadDeps(attr.Expr); diags.HasErrors() {
+		return "", diags
+	}
+	value, diags := attr.Expr.Value(ectx)
+	if diags != nil {
+		return "", diags
+	}
+
+	value, err := convert.Convert(value, cty.String)
+	if err != nil {
+		return "", err
+	}
+	return value.AsString(), nil
+}
+
 func TargetsToBuildOpt(m map[string]*Target, inp *Input) (map[string]build.Options, error) {
 	m2 := make(map[string]build.Options, len(m))
 	for k, v := range m {
@@ -802,7 +919,7 @@ func updateContext(t *build.Inputs, inp *Input) {
 		if strings.HasPrefix(v.Path, "cwd://") || strings.HasPrefix(v.Path, "target:") || strings.HasPrefix(v.Path, "docker-image:") {
 			continue
 		}
-		if IsRemoteURL(v.Path) {
+		if build.IsRemoteURL(v.Path) {
 			continue
 		}
 		st := llb.Scratch().File(llb.Copy(*inp.State, v.Path, "/"), llb.WithCustomNamef("set context %s to %s", k, v.Path))
@@ -816,7 +933,7 @@ func updateContext(t *build.Inputs, inp *Input) {
 	if strings.HasPrefix(t.ContextPath, "cwd://") {
 		return
 	}
-	if IsRemoteURL(t.ContextPath) {
+	if build.IsRemoteURL(t.ContextPath) {
 		return
 	}
 	st := llb.Scratch().File(llb.Copy(*inp.State, t.ContextPath, "/"), llb.WithCustomNamef("set context to %s", t.ContextPath))
@@ -852,7 +969,7 @@ func validateContextsEntitlements(t build.Inputs, inp *Input) error {
 }
 
 func checkPath(p string) error {
-	if IsRemoteURL(p) || strings.HasPrefix(p, "target:") || strings.HasPrefix(p, "docker-image:") {
+	if build.IsRemoteURL(p) || strings.HasPrefix(p, "target:") || strings.HasPrefix(p, "docker-image:") {
 		return nil
 	}
 	p, err := filepath.EvalSymlinks(p)
@@ -888,7 +1005,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if t.Context != nil {
 		contextPath = *t.Context
 	}
-	if !strings.HasPrefix(contextPath, "cwd://") && !IsRemoteURL(contextPath) {
+	if !strings.HasPrefix(contextPath, "cwd://") && !build.IsRemoteURL(contextPath) {
 		contextPath = path.Clean(contextPath)
 	}
 	dockerfilePath := "Dockerfile"
@@ -896,7 +1013,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		dockerfilePath = *t.Dockerfile
 	}
 
-	if !isRemoteResource(contextPath) && !path.IsAbs(dockerfilePath) {
+	if !build.IsRemoteURL(contextPath) && !path.IsAbs(dockerfilePath) {
 		dockerfilePath = path.Join(contextPath, dockerfilePath)
 	}
 
@@ -978,17 +1095,24 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	bo.Session = append(bo.Session, secrets)
-
-	sshSpecs := t.SSH
-	if len(sshSpecs) == 0 && buildflags.IsGitSSH(contextPath) {
-		sshSpecs = []string{"default"}
-	}
-	ssh, err := buildflags.ParseSSHSpecs(sshSpecs)
+	secretAttachment, err := controllerapi.CreateSecrets(secrets)
 	if err != nil {
 		return nil, err
 	}
-	bo.Session = append(bo.Session, ssh)
+	bo.Session = append(bo.Session, secretAttachment)
+
+	sshSpecs, err := buildflags.ParseSSHSpecs(t.SSH)
+	if err != nil {
+		return nil, err
+	}
+	if len(sshSpecs) == 0 && buildflags.IsGitSSH(contextPath) {
+		sshSpecs = append(sshSpecs, &controllerapi.SSH{ID: "default"})
+	}
+	sshAttachment, err := controllerapi.CreateSSH(sshSpecs)
+	if err != nil {
+		return nil, err
+	}
+	bo.Session = append(bo.Session, sshAttachment)
 
 	if t.Target != nil {
 		bo.Target = *t.Target
@@ -998,25 +1122,28 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	bo.CacheFrom = cacheImports
+	bo.CacheFrom = controllerapi.CreateCaches(cacheImports)
 
 	cacheExports, err := buildflags.ParseCacheEntry(t.CacheTo)
 	if err != nil {
 		return nil, err
 	}
-	bo.CacheTo = cacheExports
+	bo.CacheTo = controllerapi.CreateCaches(cacheExports)
 
-	outputs, err := buildflags.ParseOutputs(t.Outputs)
+	outputs, err := buildflags.ParseExports(t.Outputs)
 	if err != nil {
 		return nil, err
 	}
-	bo.Exports = outputs
+	bo.Exports, err = controllerapi.CreateExports(outputs)
+	if err != nil {
+		return nil, err
+	}
 
 	attests, err := buildflags.ParseAttests(t.Attest)
 	if err != nil {
 		return nil, err
 	}
-	bo.Attests = attests
+	bo.Attests = controllerapi.CreateAttestations(attests)
 
 	return bo, nil
 }
@@ -1040,10 +1167,6 @@ func removeDupes(s []string) []string {
 		i++
 	}
 	return s[:i]
-}
-
-func isRemoteResource(str string) bool {
-	return urlutil.IsGitURL(str) || urlutil.IsURL(str)
 }
 
 func parseOutputType(str string) string {

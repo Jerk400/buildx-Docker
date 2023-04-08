@@ -20,20 +20,21 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func NewClient(addr string) (*Client, error) {
+func NewClient(ctx context.Context, addr string) (*Client, error) {
 	backoffConfig := backoff.DefaultConfig
 	backoffConfig.MaxDelay = 3 * time.Second
 	connParams := grpc.ConnectParams{
 		Backoff: backoffConfig,
 	}
 	gopts := []grpc.DialOption{
+		grpc.WithBlock(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(connParams),
 		grpc.WithContextDialer(dialer.ContextDialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
 	}
-	conn, err := grpc.Dial(dialer.DialAddress(addr), gopts...)
+	conn, err := grpc.DialContext(ctx, dialer.DialAddress(addr), gopts...)
 	if err != nil {
 		return nil, err
 	}
@@ -74,15 +75,28 @@ func (c *Client) Disconnect(ctx context.Context, key string) error {
 	return err
 }
 
-func (c *Client) Invoke(ctx context.Context, ref string, containerConfig pb.ContainerConfig, in io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) error {
-	if ref == "" {
+func (c *Client) ListProcesses(ctx context.Context, ref string) (infos []*pb.ProcessInfo, retErr error) {
+	res, err := c.client().ListProcesses(ctx, &pb.ListProcessesRequest{Ref: ref})
+	if err != nil {
+		return nil, err
+	}
+	return res.Infos, nil
+}
+
+func (c *Client) DisconnectProcess(ctx context.Context, ref, pid string) error {
+	_, err := c.client().DisconnectProcess(ctx, &pb.DisconnectProcessRequest{Ref: ref, ProcessID: pid})
+	return err
+}
+
+func (c *Client) Invoke(ctx context.Context, ref string, pid string, invokeConfig pb.InvokeConfig, in io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) error {
+	if ref == "" || pid == "" {
 		return errors.New("build reference must be specified")
 	}
 	stream, err := c.client().Invoke(ctx)
 	if err != nil {
 		return err
 	}
-	return attachIO(ctx, stream, &pb.InitMessage{Ref: ref, ContainerConfig: &containerConfig}, ioAttachConfig{
+	return attachIO(ctx, stream, &pb.InitMessage{Ref: ref, ProcessID: pid, InvokeConfig: &invokeConfig}, ioAttachConfig{
 		stdin:  in,
 		stdout: stdout,
 		stderr: stderr,
@@ -90,18 +104,21 @@ func (c *Client) Invoke(ctx context.Context, ref string, containerConfig pb.Cont
 	})
 }
 
-func (c *Client) Build(ctx context.Context, options pb.BuildOptions, in io.ReadCloser, w io.Writer, out console.File, progressMode string) (string, error) {
+func (c *Client) Build(ctx context.Context, options pb.BuildOptions, in io.ReadCloser, w io.Writer, out console.File, progressMode string) (string, *client.SolveResponse, error) {
 	ref := identity.NewID()
 	pw, err := progress.NewPrinter(context.TODO(), w, out, progressMode)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	statusChan := make(chan *client.SolveStatus)
 	statusDone := make(chan struct{})
 	eg, egCtx := errgroup.WithContext(ctx)
+	var resp *client.SolveResponse
 	eg.Go(func() error {
 		defer close(statusChan)
-		return c.build(egCtx, ref, options, in, statusChan)
+		var err error
+		resp, err = c.build(egCtx, ref, options, in, statusChan)
+		return err
 	})
 	eg.Go(func() error {
 		defer close(statusDone)
@@ -115,19 +132,26 @@ func (c *Client) Build(ctx context.Context, options pb.BuildOptions, in io.ReadC
 		<-statusDone
 		return pw.Wait()
 	})
-	return ref, eg.Wait()
+	return ref, resp, eg.Wait()
 }
 
-func (c *Client) build(ctx context.Context, ref string, options pb.BuildOptions, in io.ReadCloser, statusChan chan *client.SolveStatus) error {
+func (c *Client) build(ctx context.Context, ref string, options pb.BuildOptions, in io.ReadCloser, statusChan chan *client.SolveStatus) (*client.SolveResponse, error) {
 	eg, egCtx := errgroup.WithContext(ctx)
 	done := make(chan struct{})
+
+	var resp *client.SolveResponse
+
 	eg.Go(func() error {
 		defer close(done)
-		if _, err := c.client().Build(egCtx, &pb.BuildRequest{
+		pbResp, err := c.client().Build(egCtx, &pb.BuildRequest{
 			Ref:     ref,
 			Options: &options,
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		resp = &client.SolveResponse{
+			ExporterResponse: pbResp.ExporterResponse,
 		}
 		return nil
 	})
@@ -253,7 +277,7 @@ func (c *Client) build(ctx context.Context, ref string, options pb.BuildOptions,
 			return eg2.Wait()
 		})
 	}
-	return eg.Wait()
+	return resp, eg.Wait()
 }
 
 func (c *Client) client() pb.ControllerClient {

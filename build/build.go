@@ -77,18 +77,18 @@ type Options struct {
 	CgroupParent  string
 	Exports       []client.ExportEntry
 	ExtraHosts    []string
-	ImageIDFile   string
 	Labels        map[string]string
 	NetworkMode   string
 	NoCache       bool
 	NoCacheFilter []string
 	Platforms     []specs.Platform
 	Pull          bool
-	Session       []session.Attachable
 	ShmSize       opts.MemBytes
 	Tags          []string
 	Target        string
 	Ulimits       *opts.UlimitOpt
+
+	Session []session.Attachable
 
 	// Linked marks this target as exclusively linked (not requested by the user).
 	Linked    bool
@@ -375,13 +375,6 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		}
 	}()
 
-	if opt.ImageIDFile != "" {
-		// Avoid leaving a stale file if we eventually fail
-		if err := os.Remove(opt.ImageIDFile); err != nil && !os.IsNotExist(err) {
-			return nil, nil, errors.Wrap(err, "removing image ID file")
-		}
-	}
-
 	// inline cache from build arg
 	if v, ok := opt.BuildArgs["BUILDKIT_INLINE_CACHE"]; ok {
 		if v, _ := strconv.ParseBool(v); v {
@@ -462,11 +455,22 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 			return nil, nil, errors.Errorf("attestations are not supported by the current buildkitd")
 		}
 		for k, v := range attests {
-			so.FrontendAttrs[k] = v
+			so.FrontendAttrs["attest:"+k] = v
 		}
 	}
-	if _, ok := opt.Attests["attest:provenance"]; !ok && supportsAttestations {
-		so.FrontendAttrs["attest:provenance"] = "mode=min,inline-only=true"
+
+	if _, ok := opt.Attests["provenance"]; !ok && supportsAttestations {
+		const noAttestEnv = "BUILDX_NO_DEFAULT_ATTESTATIONS"
+		var noProv bool
+		if v, ok := os.LookupEnv(noAttestEnv); ok {
+			noProv, err = strconv.ParseBool(v)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "invalid "+noAttestEnv)
+			}
+		}
+		if !noProv {
+			so.FrontendAttrs["attest:provenance"] = "mode=min,inline-only=true"
+		}
 	}
 
 	switch len(opt.Exports) {
@@ -519,9 +523,6 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 
 	// set up exporters
 	for i, e := range opt.Exports {
-		if (e.Type == "local" || e.Type == "tar") && opt.ImageIDFile != "" {
-			return nil, nil, errors.Errorf("local and tar exporters are incompatible with image ID file")
-		}
 		if e.Type == "oci" && !nodeDriver.Features()[driver.OCIExporter] {
 			return nil, nil, notSupported(nodeDriver, driver.OCIExporter)
 		}
@@ -603,13 +604,6 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		}
 	}
 
-	// Propagate SOURCE_DATE_EPOCH from the client env
-	if v := os.Getenv("SOURCE_DATE_EPOCH"); v != "" {
-		if _, ok := so.FrontendAttrs["build-arg:SOURCE_DATE_EPOCH"]; !ok {
-			so.FrontendAttrs["build-arg:SOURCE_DATE_EPOCH"] = v
-		}
-	}
-
 	// set platforms
 	if len(opt.Platforms) != 0 {
 		pp := make([]string, len(opt.Platforms))
@@ -657,151 +651,6 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 	}
 
 	return &so, releaseF, nil
-}
-
-// ContainerConfig is configuration for a container to run.
-type ContainerConfig struct {
-	ResultCtx *ResultContext
-
-	Stdin  io.ReadCloser
-	Stdout io.WriteCloser
-	Stderr io.WriteCloser
-	Tty    bool
-
-	Entrypoint []string
-	Cmd        []string
-	Env        []string
-	User       *string
-	Cwd        *string
-}
-
-// ResultContext is a build result with the client that built it.
-type ResultContext struct {
-	Client *client.Client
-	Res    *gateway.Result
-}
-
-// Invoke invokes a build result as a container.
-func Invoke(ctx context.Context, cfg ContainerConfig) error {
-	if cfg.ResultCtx == nil {
-		return errors.Errorf("result must be provided")
-	}
-	c, res := cfg.ResultCtx.Client, cfg.ResultCtx.Res
-
-	mainCtx := ctx
-
-	_, err := c.Build(context.TODO(), client.SolveOpt{}, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
-		ctx, cancel := context.WithCancel(ctx)
-		go func() {
-			<-mainCtx.Done()
-			cancel()
-		}()
-
-		if res.Ref == nil {
-			return nil, errors.Errorf("no reference is registered")
-		}
-		st, err := res.Ref.ToState()
-		if err != nil {
-			return nil, err
-		}
-		def, err := st.Marshal(ctx)
-		if err != nil {
-			return nil, err
-		}
-		imgRef, err := c.Solve(ctx, gateway.SolveRequest{
-			Definition: def.ToPB(),
-		})
-		if err != nil {
-			return nil, err
-		}
-		ctr, err := c.NewContainer(ctx, gateway.NewContainerRequest{
-			Mounts: []gateway.Mount{
-				{
-					Dest:      "/",
-					MountType: pb.MountType_BIND,
-					Ref:       imgRef.Ref,
-				},
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		defer ctr.Release(context.TODO())
-
-		imgData := res.Metadata[exptypes.ExporterImageConfigKey]
-		var img *specs.Image
-		if len(imgData) > 0 {
-			img = &specs.Image{}
-			if err := json.Unmarshal(imgData, img); err != nil {
-				fmt.Println(err)
-				return nil, err
-			}
-		}
-
-		user := ""
-		if cfg.User != nil {
-			user = *cfg.User
-		} else if img != nil {
-			user = img.Config.User
-		}
-
-		cwd := ""
-		if cfg.Cwd != nil {
-			cwd = *cfg.Cwd
-		} else if img != nil {
-			cwd = img.Config.WorkingDir
-		}
-
-		env := []string{}
-		if img != nil {
-			env = append(env, img.Config.Env...)
-		}
-		env = append(env, cfg.Env...)
-
-		args := []string{}
-		if cfg.Entrypoint != nil {
-			args = append(args, cfg.Entrypoint...)
-		} else if img != nil {
-			args = append(args, img.Config.Entrypoint...)
-		}
-		if cfg.Cmd != nil {
-			args = append(args, cfg.Cmd...)
-		} else if img != nil {
-			args = append(args, img.Config.Cmd...)
-		}
-
-		proc, err := ctr.Start(ctx, gateway.StartRequest{
-			Args:   args,
-			Env:    env,
-			User:   user,
-			Cwd:    cwd,
-			Tty:    cfg.Tty,
-			Stdin:  cfg.Stdin,
-			Stdout: cfg.Stdout,
-			Stderr: cfg.Stderr,
-		})
-		if err != nil {
-			return nil, errors.Errorf("failed to start container: %v", err)
-		}
-		errCh := make(chan error)
-		doneCh := make(chan struct{})
-		go func() {
-			if err := proc.Wait(); err != nil {
-				errCh <- err
-				return
-			}
-			close(doneCh)
-		}()
-		select {
-		case <-doneCh:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-errCh:
-			return nil, err
-		}
-		return nil, nil
-	}, nil)
-	return err
 }
 
 func Build(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer) (resp map[string]*client.SolveResponse, err error) {
@@ -1143,13 +992,6 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 				resp[k] = res[0]
 				respMu.Unlock()
 				if len(res) == 1 {
-					dgst := res[0].ExporterResponse[exptypes.ExporterImageDigestKey]
-					if v, ok := res[0].ExporterResponse[exptypes.ExporterImageConfigDigestKey]; ok {
-						dgst = v
-					}
-					if opt.ImageIDFile != "" {
-						return os.WriteFile(opt.ImageIDFile, []byte(dgst), 0644)
-					}
 					return nil
 				}
 
@@ -1227,11 +1069,6 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 							if err != nil {
 								return err
 							}
-							if opt.ImageIDFile != "" {
-								if err := os.WriteFile(opt.ImageIDFile, []byte(desc.Digest), 0644); err != nil {
-									return err
-								}
-							}
 
 							itpush := imagetools.New(imageopt)
 
@@ -1248,7 +1085,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 							respMu.Lock()
 							resp[k] = &client.SolveResponse{
 								ExporterResponse: map[string]string{
-									"containerimage.digest": desc.Digest.String(),
+									exptypes.ExporterImageDigestKey: desc.Digest.String(),
 								},
 							}
 							respMu.Unlock()
@@ -1441,7 +1278,6 @@ func LoadInputs(ctx context.Context, d driver.Driver, inp Inputs, pw progress.Wr
 				target.LocalDirs["context"] = inp.ContextPath
 			}
 		}
-
 	case isLocalDir(inp.ContextPath):
 		target.LocalDirs["context"] = inp.ContextPath
 		switch inp.DockerfilePath {
@@ -1453,8 +1289,7 @@ func LoadInputs(ctx context.Context, d driver.Driver, inp Inputs, pw progress.Wr
 			dockerfileDir = filepath.Dir(inp.DockerfilePath)
 			dockerfileName = filepath.Base(inp.DockerfilePath)
 		}
-
-	case urlutil.IsGitURL(inp.ContextPath), urlutil.IsURL(inp.ContextPath):
+	case IsRemoteURL(inp.ContextPath):
 		if inp.DockerfilePath == "-" {
 			dockerfileReader = inp.InStream
 		}
@@ -1509,7 +1344,7 @@ func LoadInputs(ctx context.Context, d driver.Driver, inp Inputs, pw progress.Wr
 			continue
 		}
 
-		if urlutil.IsGitURL(v.Path) || urlutil.IsURL(v.Path) || strings.HasPrefix(v.Path, "docker-image://") || strings.HasPrefix(v.Path, "target:") {
+		if IsRemoteURL(v.Path) || strings.HasPrefix(v.Path, "docker-image://") || strings.HasPrefix(v.Path, "target:") {
 			target.FrontendAttrs["context:"+k] = v.Path
 			continue
 		}
@@ -1650,8 +1485,8 @@ func waitContextDeps(ctx context.Context, index int, results *waitmap.Map, so *c
 				if dt, ok := rr.Metadata[exptypes.ExporterImageConfigKey+"/"+platform]; ok {
 					metadata[exptypes.ExporterImageConfigKey] = dt
 				}
-				if dt, ok := rr.Metadata[exptypes.ExporterBuildInfo+"/"+platform]; ok {
-					metadata[exptypes.ExporterBuildInfo] = dt
+				if dt, ok := rr.Metadata["containerimage.buildinfo/"+platform]; ok {
+					metadata["containerimage.buildinfo"] = dt
 				}
 				if len(metadata) > 0 {
 					dt, err := json.Marshal(metadata)
@@ -1674,8 +1509,8 @@ func waitContextDeps(ctx context.Context, index int, results *waitmap.Map, so *c
 			if dt, ok := rr.Metadata[exptypes.ExporterImageConfigKey]; ok {
 				metadata[exptypes.ExporterImageConfigKey] = dt
 			}
-			if dt, ok := rr.Metadata[exptypes.ExporterBuildInfo]; ok {
-				metadata[exptypes.ExporterBuildInfo] = dt
+			if dt, ok := rr.Metadata["containerimage.buildinfo"]; ok {
+				metadata["containerimage.buildinfo"] = dt
 			}
 			if len(metadata) > 0 {
 				dt, err := json.Marshal(metadata)

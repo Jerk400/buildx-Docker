@@ -1,11 +1,11 @@
-# syntax=docker/dockerfile-upstream:master
+# syntax=docker/dockerfile:1
 
 # Forked from https://github.com/moby/buildkit/blob/e1b3b6c4abf7684f13e6391e5f7bc9210752687a/hack/dockerfiles/generated-files.Dockerfile
 # Copyright The BuildKit Authors.
 # Copyright The Buildx Authors.
 # Licensed under the Apache License, Version 2.0
 
-ARG GO_VERSION="1.19"
+ARG GO_VERSION="1.20"
 ARG PROTOC_VERSION="3.11.4"
 
 # protoc is dynamically linked to glibc so can't use alpine base
