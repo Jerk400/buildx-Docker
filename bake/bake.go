@@ -12,11 +12,13 @@ import (
 	"strconv"
 	"strings"
 
+	composecli "github.com/compose-spec/compose-go/cli"
 	"github.com/docker/buildx/bake/hclparser"
 	"github.com/docker/buildx/build"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/platformutil"
+
 	"github.com/docker/cli/cli/config"
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/moby/buildkit/client/llb"
@@ -27,9 +29,6 @@ import (
 )
 
 var (
-	httpPrefix                   = regexp.MustCompile(`^https?://`)
-	gitURLPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
-
 	validTargetNameChars = `[a-zA-Z0-9_-]+`
 	targetNamePattern    = regexp.MustCompile(`^` + validTargetNameChars + `$`)
 )
@@ -45,14 +44,15 @@ type Override struct {
 }
 
 func defaultFilenames() []string {
-	return []string{
-		"docker-compose.yml",  // support app
-		"docker-compose.yaml", // support app
+	names := []string{}
+	names = append(names, composecli.DefaultFileNames...)
+	names = append(names, []string{
 		"docker-bake.json",
 		"docker-bake.override.json",
 		"docker-bake.hcl",
 		"docker-bake.override.hcl",
-	}
+	}...)
+	return names
 }
 
 func ReadLocalFiles(names []string) ([]File, error) {
@@ -1105,7 +1105,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(sshSpecs) == 0 && buildflags.IsGitSSH(contextPath) {
+	if len(sshSpecs) == 0 && (buildflags.IsGitSSH(bi.ContextPath) || (inp != nil && buildflags.IsGitSSH(inp.URL))) {
 		sshSpecs = append(sshSpecs, &controllerapi.SSH{ID: "default"})
 	}
 	sshAttachment, err := controllerapi.CreateSSH(sshSpecs)
