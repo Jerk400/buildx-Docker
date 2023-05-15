@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/moby/buildkit/client"
@@ -14,13 +15,14 @@ import (
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/solver/result"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
-func NewResultContext(c *client.Client, solveOpt client.SolveOpt, res *gateway.Result) (*ResultContext, error) {
-	ctx := context.Background()
+func NewResultContext(ctx context.Context, c *client.Client, solveOpt client.SolveOpt, res *gateway.Result) (*ResultContext, error) {
 	def, err := getDefinition(ctx, res)
 	if err != nil {
 		return nil, err
@@ -28,23 +30,21 @@ func NewResultContext(c *client.Client, solveOpt client.SolveOpt, res *gateway.R
 	return getResultAt(ctx, c, solveOpt, def, nil)
 }
 
-func getDefinition(ctx context.Context, res *gateway.Result) (*pb.Definition, error) {
-	ref, err := res.SingleRef()
-	if err != nil {
-		return nil, err
-	}
-	st, err := ref.ToState()
-	if err != nil {
-		return nil, err
-	}
-	def, err := st.Marshal(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return def.ToPB(), nil
+func getDefinition(ctx context.Context, res *gateway.Result) (*result.Result[*pb.Definition], error) {
+	return result.ConvertResult(res, func(ref gateway.Reference) (*pb.Definition, error) {
+		st, err := ref.ToState()
+		if err != nil {
+			return nil, err
+		}
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return def.ToPB(), nil
+	})
 }
 
-func getResultAt(ctx context.Context, c *client.Client, solveOpt client.SolveOpt, target *pb.Definition, statusChan chan *client.SolveStatus) (*ResultContext, error) {
+func getResultAt(ctx context.Context, c *client.Client, solveOpt client.SolveOpt, targets *result.Result[*pb.Definition], statusChan chan *client.SolveStatus) (*ResultContext, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -73,15 +73,36 @@ func getResultAt(ctx context.Context, c *client.Client, solveOpt client.SolveOpt
 	resultCtxCh := make(chan *ResultContext)
 	errCh := make(chan error)
 	go func() {
+		solveOpt := solveOpt
+		solveOpt.Ref = ""
+		buildDoneCh := make(chan struct{})
 		_, err := c.Build(context.Background(), solveOpt, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			resultCtx := ResultContext{}
-			res2, err := c.Solve(ctx, gateway.SolveRequest{
-				Evaluate:   true,
-				Definition: target,
+			doneErr := errors.Errorf("done")
+			ctx, cancel := context.WithCancelCause(ctx)
+			defer cancel(doneErr)
+
+			// force evaluation of all targets in parallel
+			results := make(map[*pb.Definition]*gateway.Result)
+			resultsMu := sync.Mutex{}
+			eg, egCtx := errgroup.WithContext(ctx)
+			targets.EachRef(func(def *pb.Definition) error {
+				eg.Go(func() error {
+					res2, err := c.Solve(egCtx, gateway.SolveRequest{
+						Evaluate:   true,
+						Definition: def,
+					})
+					if err != nil {
+						return err
+					}
+					resultsMu.Lock()
+					results[def] = res2
+					resultsMu.Unlock()
+					return nil
+				})
+				return nil
 			})
-			if err != nil {
+			resultCtx := ResultContext{}
+			if err := eg.Wait(); err != nil {
 				var se *errdefs.SolveError
 				if errors.As(err, &se) {
 					resultCtx.solveErr = se
@@ -89,19 +110,39 @@ func getResultAt(ctx context.Context, c *client.Client, solveOpt client.SolveOpt
 					return nil, err
 				}
 			}
+			res2, _ := result.ConvertResult(targets, func(def *pb.Definition) (gateway.Reference, error) {
+				if res, ok := results[def]; ok {
+					return res.Ref, nil
+				}
+				return nil, nil
+			})
+
 			// Record the client and ctx as well so that containers can be created from the SolveError.
 			resultCtx.res = res2
 			resultCtx.gwClient = c
 			resultCtx.gwCtx = ctx
-			resultCtx.gwDone = cancel
+			resultCtx.gwDone = func() {
+				cancel(doneErr)
+				// wait for Build() completion(or timeout) to ensure the Build's finalizing and avoiding an error "context canceled"
+				select {
+				case <-buildDoneCh:
+				case <-time.After(5 * time.Second):
+				}
+			}
 			select {
 			case resultCtxCh <- &resultCtx:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
+
+			// wait for cleanup or cancel
 			<-ctx.Done()
+			if context.Cause(ctx) != doneErr { // doneErr is not an error.
+				return nil, ctx.Err()
+			}
 			return nil, nil
 		}, ch)
+		close(buildDoneCh)
 		if err != nil {
 			errCh <- err
 		}
@@ -191,32 +232,25 @@ func (r *ResultContext) getProcessConfig(cfg *controllerapi.InvokeConfig, stdin 
 }
 
 func containerConfigFromResult(ctx context.Context, res *gateway.Result, c gateway.Client, cfg controllerapi.InvokeConfig) (*gateway.NewContainerRequest, error) {
-	if res.Ref == nil {
-		return nil, errors.Errorf("no reference is registered")
-	}
 	if cfg.Initial {
 		return nil, errors.Errorf("starting from the container from the initial state of the step is supported only on the failed steps")
 	}
-	st, err := res.Ref.ToState()
+
+	ps, err := exptypes.ParsePlatforms(res.Metadata)
 	if err != nil {
 		return nil, err
 	}
-	def, err := st.Marshal(ctx)
-	if err != nil {
-		return nil, err
+	ref, ok := res.FindRef(ps.Platforms[0].ID)
+	if !ok {
+		return nil, errors.Errorf("no reference found")
 	}
-	imgRef, err := c.Solve(ctx, gateway.SolveRequest{
-		Definition: def.ToPB(),
-	})
-	if err != nil {
-		return nil, err
-	}
+
 	return &gateway.NewContainerRequest{
 		Mounts: []gateway.Mount{
 			{
 				Dest:      "/",
 				MountType: pb.MountType_BIND,
-				Ref:       imgRef.Ref,
+				Ref:       ref,
 			},
 		},
 	}, nil

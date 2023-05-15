@@ -25,6 +25,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/driver"
+	"github.com/docker/buildx/localstate"
 	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
@@ -45,6 +46,7 @@ import (
 	"github.com/moby/buildkit/session/upload/uploadprovider"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
+	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/progress/progresswriter"
@@ -91,8 +93,9 @@ type Options struct {
 	Session []session.Attachable
 
 	// Linked marks this target as exclusively linked (not requested by the user).
-	Linked    bool
-	PrintFunc *PrintFunc
+	Linked       bool
+	PrintFunc    *PrintFunc
+	SourcePolicy *spb.Policy
 }
 
 type PrintFunc struct {
@@ -426,6 +429,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		CacheExports:        cacheTo,
 		CacheImports:        cacheFrom,
 		AllowedEntitlements: opt.Allow,
+		SourcePolicy:        opt.SourcePolicy,
 	}
 
 	if opt.CgroupParent != "" {
@@ -648,6 +652,12 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		return nil, nil, err
 	} else if len(ulimits) > 0 {
 		so.FrontendAttrs["ulimit"] = ulimits
+	}
+
+	// remember local state like directory path that is not sent to buildkit
+	so.Ref = identity.NewID()
+	if err := saveLocalState(so, opt, node, configDir); err != nil {
+		return nil, nil, err
 	}
 
 	return &so, releaseF, nil
@@ -920,7 +930,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 							}
 							results.Set(resultKey(dp.driverIndex, k), res)
 							if resultHandleFunc != nil {
-								resultCtx, err := NewResultContext(cc, so, res)
+								resultCtx, err := NewResultContext(ctx, cc, so, res)
 								if err == nil {
 									resultHandleFunc(dp.driverIndex, resultCtx)
 								} else {
@@ -1616,4 +1626,66 @@ func noPrintFunc(opt map[string]Options) bool {
 		}
 	}
 	return true
+}
+
+func saveLocalState(so client.SolveOpt, opt Options, node builder.Node, configDir string) error {
+	var err error
+
+	if so.Ref == "" {
+		return nil
+	}
+
+	lp := opt.Inputs.ContextPath
+	dp := opt.Inputs.DockerfilePath
+	if lp != "" || dp != "" {
+		if lp != "" {
+			lp, err = filepath.Abs(lp)
+			if err != nil {
+				return err
+			}
+		}
+		if dp != "" {
+			dp, err = filepath.Abs(dp)
+			if err != nil {
+				return err
+			}
+		}
+		ls, err := localstate.New(configDir)
+		if err != nil {
+			return err
+		}
+		if err := ls.SaveRef(node.Builder, node.Name, so.Ref, localstate.State{
+			LocalPath:      lp,
+			DockerfilePath: dp,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ReadSourcePolicy reads a source policy from a file.
+// The file path is taken from EXPERIMENTAL_BUILDKIT_SOURCE_POLICY env var.
+// if the env var is not set, this `returns nil, nil`
+func ReadSourcePolicy() (*spb.Policy, error) {
+	p := os.Getenv("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY")
+	if p == "" {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read policy file")
+	}
+	var pol spb.Policy
+	if err := json.Unmarshal(data, &pol); err != nil {
+		// maybe it's in protobuf format?
+		e2 := pol.Unmarshal(data)
+		if e2 != nil {
+			return nil, errors.Wrap(err, "failed to parse source policy")
+		}
+	}
+
+	return &pol, nil
 }

@@ -85,6 +85,21 @@ func ReadLocalFiles(names []string) ([]File, error) {
 	return out, nil
 }
 
+func ListTargets(files []File) ([]string, error) {
+	c, err := ParseFiles(files, nil)
+	if err != nil {
+		return nil, err
+	}
+	var targets []string
+	for _, g := range c.Groups {
+		targets = append(targets, g.Name)
+	}
+	for _, t := range c.Targets {
+		targets = append(targets, t.Name)
+	}
+	return dedupSlice(targets), nil
+}
+
 func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults map[string]string) (map[string]*Target, map[string]*Group, error) {
 	c, err := ParseFiles(files, defaults)
 	if err != nil {
@@ -593,7 +608,7 @@ type Target struct {
 	NoCache          *bool              `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
 	NetworkMode      *string            `json:"-" hcl:"-" cty:"-"`
 	NoCacheFilter    []string           `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
-	// IMPORTANT: if you add more fields here, do not forget to update newOverrides and docs/manuals/bake/file-definition.md.
+	// IMPORTANT: if you add more fields here, do not forget to update newOverrides and docs/bake-reference.md.
 
 	// linked is a private field to mark a target used as a linked one
 	linked bool
@@ -936,7 +951,12 @@ func updateContext(t *build.Inputs, inp *Input) {
 	if build.IsRemoteURL(t.ContextPath) {
 		return
 	}
-	st := llb.Scratch().File(llb.Copy(*inp.State, t.ContextPath, "/"), llb.WithCustomNamef("set context to %s", t.ContextPath))
+	st := llb.Scratch().File(
+		llb.Copy(*inp.State, t.ContextPath, "/", &llb.CopyInfo{
+			CopyDirContentsOnly: true,
+		}),
+		llb.WithCustomNamef("set context to %s", t.ContextPath),
+	)
 	t.ContextState = &st
 }
 
@@ -1013,9 +1033,32 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		dockerfilePath = *t.Dockerfile
 	}
 
-	if !build.IsRemoteURL(contextPath) && !path.IsAbs(dockerfilePath) {
-		dockerfilePath = path.Join(contextPath, dockerfilePath)
+	bi := build.Inputs{
+		ContextPath:    contextPath,
+		DockerfilePath: dockerfilePath,
+		NamedContexts:  toNamedContexts(t.Contexts),
 	}
+	if t.DockerfileInline != nil {
+		bi.DockerfileInline = *t.DockerfileInline
+	}
+	updateContext(&bi, inp)
+	if !build.IsRemoteURL(bi.ContextPath) && bi.ContextState == nil && !path.IsAbs(bi.DockerfilePath) {
+		bi.DockerfilePath = path.Join(bi.ContextPath, bi.DockerfilePath)
+	}
+	if strings.HasPrefix(bi.ContextPath, "cwd://") {
+		bi.ContextPath = path.Clean(strings.TrimPrefix(bi.ContextPath, "cwd://"))
+	}
+	for k, v := range bi.NamedContexts {
+		if strings.HasPrefix(v.Path, "cwd://") {
+			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
+		}
+	}
+
+	if err := validateContextsEntitlements(bi, inp); err != nil {
+		return nil, err
+	}
+
+	t.Context = &bi.ContextPath
 
 	args := map[string]string{}
 	for k, v := range t.Args {
@@ -1045,30 +1088,6 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if t.NetworkMode != nil {
 		networkMode = *t.NetworkMode
 	}
-
-	bi := build.Inputs{
-		ContextPath:    contextPath,
-		DockerfilePath: dockerfilePath,
-		NamedContexts:  toNamedContexts(t.Contexts),
-	}
-	if t.DockerfileInline != nil {
-		bi.DockerfileInline = *t.DockerfileInline
-	}
-	updateContext(&bi, inp)
-	if strings.HasPrefix(bi.ContextPath, "cwd://") {
-		bi.ContextPath = path.Clean(strings.TrimPrefix(bi.ContextPath, "cwd://"))
-	}
-	for k, v := range bi.NamedContexts {
-		if strings.HasPrefix(v.Path, "cwd://") {
-			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
-		}
-	}
-
-	if err := validateContextsEntitlements(bi, inp); err != nil {
-		return nil, err
-	}
-
-	t.Context = &bi.ContextPath
 
 	bo := &build.Options{
 		Inputs:        bi,
@@ -1144,6 +1163,11 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		return nil, err
 	}
 	bo.Attests = controllerapi.CreateAttestations(attests)
+
+	bo.SourcePolicy, err = build.ReadSourcePolicy()
+	if err != nil {
+		return nil, err
+	}
 
 	return bo, nil
 }

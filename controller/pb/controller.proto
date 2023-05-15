@@ -3,6 +3,7 @@ syntax = "proto3";
 package buildx.controller.v1;
 
 import "github.com/moby/buildkit/api/services/control/control.proto";
+import "github.com/moby/buildkit/sourcepolicy/pb/policy.proto";
 
 option go_package = "pb";
 
@@ -48,7 +49,7 @@ message BuildRequest {
 message BuildOptions {
   string ContextPath = 1;
   string DockerfileName = 2;
-  string PrintFunc = 3;
+  PrintFunc PrintFunc = 3;
   map<string, string> NamedContexts = 4;
 
   repeated string Allow = 5;
@@ -71,11 +72,11 @@ message BuildOptions {
   UlimitOpt Ulimits = 22;
 
   string Builder = 23;
-  string MetadataFile = 24;
-  bool NoCache = 25;
-  bool Pull = 26;
-  bool ExportPush = 27;
-  bool ExportLoad = 28;
+  bool NoCache = 24;
+  bool Pull = 25;
+  bool ExportPush = 26;
+  bool ExportLoad = 27;
+  moby.buildkit.v1.sourcepolicy.Policy SourcePolicy = 28;
 }
 
 message ExportEntry {
@@ -104,6 +105,11 @@ message Secret {
   string ID = 1;
   string FilePath = 2;
   string Env = 3;
+}
+
+message PrintFunc {
+	string Name = 1;
+	string Format = 2;
 }
 
 message InspectRequest {

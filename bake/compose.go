@@ -28,10 +28,14 @@ func ParseComposeFiles(fs []File) (*Config, error) {
 }
 
 func ParseCompose(cfgs []compose.ConfigFile, envs map[string]string) (*Config, error) {
+	if envs == nil {
+		envs = make(map[string]string)
+	}
 	cfg, err := loader.Load(compose.ConfigDetails{
 		ConfigFiles: cfgs,
 		Environment: envs,
 	}, func(options *loader.Options) {
+		options.SetProjectName("bake", false)
 		options.SkipNormalization = true
 	})
 	if err != nil {
@@ -65,6 +69,19 @@ func ParseCompose(cfgs []compose.ConfigFile, envs map[string]string) (*Config, e
 				dockerfilePath := s.Build.Dockerfile
 				dockerfilePathP = &dockerfilePath
 			}
+			var dockerfileInlineP *string
+			if s.Build.DockerfileInline != "" {
+				dockerfileInline := s.Build.DockerfileInline
+				dockerfileInlineP = &dockerfileInline
+			}
+
+			var additionalContexts map[string]string
+			if s.Build.AdditionalContexts != nil {
+				additionalContexts = map[string]string{}
+				for k, v := range s.Build.AdditionalContexts {
+					additionalContexts[k] = v
+				}
+			}
 
 			var secrets []string
 			for _, bs := range s.Build.Secrets {
@@ -84,11 +101,13 @@ func ParseCompose(cfgs []compose.ConfigFile, envs map[string]string) (*Config, e
 
 			g.Targets = append(g.Targets, targetName)
 			t := &Target{
-				Name:       targetName,
-				Context:    contextPathP,
-				Dockerfile: dockerfilePathP,
-				Tags:       s.Build.Tags,
-				Labels:     labels,
+				Name:             targetName,
+				Context:          contextPathP,
+				Contexts:         additionalContexts,
+				Dockerfile:       dockerfilePathP,
+				DockerfileInline: dockerfileInlineP,
+				Tags:             s.Build.Tags,
+				Labels:           labels,
 				Args: flatten(s.Build.Args.Resolve(func(val string) (string, bool) {
 					if val, ok := s.Environment[val]; ok && val != nil {
 						return *val, true
@@ -145,6 +164,7 @@ func validateCompose(dt []byte, envs map[string]string) error {
 		},
 		Environment: envs,
 	}, func(options *loader.Options) {
+		options.SetProjectName("bake", false)
 		options.SkipNormalization = true
 		// consistency is checked later in ParseCompose to ensure multiple
 		// compose files can be merged together
