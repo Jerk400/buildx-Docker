@@ -55,7 +55,7 @@ func defaultFilenames() []string {
 	return names
 }
 
-func ReadLocalFiles(names []string) ([]File, error) {
+func ReadLocalFiles(names []string, stdin io.Reader) ([]File, error) {
 	isDefault := false
 	if len(names) == 0 {
 		isDefault = true
@@ -67,7 +67,7 @@ func ReadLocalFiles(names []string) ([]File, error) {
 		var dt []byte
 		var err error
 		if n == "-" {
-			dt, err = io.ReadAll(os.Stdin)
+			dt, err = io.ReadAll(stdin)
 			if err != nil {
 				return nil, err
 			}
@@ -620,7 +620,7 @@ var _ hclparser.WithEvalContexts = &Group{}
 var _ hclparser.WithGetName = &Group{}
 
 func (t *Target) normalize() {
-	t.Attest = removeDupes(t.Attest)
+	t.Attest = removeAttestDupes(t.Attest)
 	t.Tags = removeDupes(t.Tags)
 	t.Secrets = removeDupes(t.Secrets)
 	t.SSH = removeDupes(t.SSH)
@@ -682,6 +682,7 @@ func (t *Target) Merge(t2 *Target) {
 	}
 	if t2.Attest != nil { // merge
 		t.Attest = append(t.Attest, t2.Attest...)
+		t.Attest = removeAttestDupes(t.Attest)
 	}
 	if t2.Secrets != nil { // merge
 		t.Secrets = append(t.Secrets, t2.Secrets...)
@@ -999,6 +1000,10 @@ func checkPath(p string) error {
 		}
 		return err
 	}
+	p, err = filepath.Abs(p)
+	if err != nil {
+		return err
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -1007,7 +1012,8 @@ func checkPath(p string) error {
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if parts[0] == ".." {
 		return errors.Errorf("path %s is outside of the working directory, please set BAKE_ALLOW_REMOTE_FS_ACCESS=1", p)
 	}
 	return nil
@@ -1191,6 +1197,26 @@ func removeDupes(s []string) []string {
 		i++
 	}
 	return s[:i]
+}
+
+func removeAttestDupes(s []string) []string {
+	res := []string{}
+	m := map[string]int{}
+	for _, v := range s {
+		att, err := buildflags.ParseAttest(v)
+		if err != nil {
+			res = append(res, v)
+			continue
+		}
+
+		if i, ok := m[att.Type]; ok {
+			res[i] = v
+		} else {
+			m[att.Type] = len(res)
+			res = append(res, v)
+		}
+	}
+	return res
 }
 
 func parseOutputType(str string) string {

@@ -26,6 +26,7 @@ import (
 	"github.com/docker/buildx/store"
 	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/buildflags"
+	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/util/tracing"
@@ -233,6 +234,15 @@ func runBuild(dockerCli command.Cli, options buildOptions) (err error) {
 	if err != nil {
 		return err
 	}
+	_, err = b.LoadNodes(ctx, false)
+	if err != nil {
+		return err
+	}
+
+	var term bool
+	if _, err := console.ConsoleFromFile(os.Stderr); err == nil {
+		term = true
+	}
 
 	ctx2, cancel := context.WithCancel(context.TODO())
 	defer cancel()
@@ -269,15 +279,15 @@ func runBuild(dockerCli command.Cli, options buildOptions) (err error) {
 		return retErr
 	}
 
-	if options.quiet {
-		fmt.Println(resp.ExporterResponse[exptypes.ExporterImageDigestKey])
+	if progressMode != progress.PrinterModeQuiet {
+		desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
+	} else {
+		fmt.Println(getImageID(resp.ExporterResponse))
 	}
 	if options.imageIDFile != "" {
-		dgst := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
-		if v, ok := resp.ExporterResponse[exptypes.ExporterImageConfigDigestKey]; ok {
-			dgst = v
+		if err := os.WriteFile(options.imageIDFile, []byte(getImageID(resp.ExporterResponse)), 0644); err != nil {
+			return errors.Wrap(err, "writing image ID file")
 		}
-		return os.WriteFile(options.imageIDFile, []byte(dgst), 0644)
 	}
 	if options.metadataFile != "" {
 		if err := writeMetadataFile(options.metadataFile, decodeExporterResponse(resp.ExporterResponse)); err != nil {
@@ -292,8 +302,20 @@ func runBuild(dockerCli command.Cli, options buildOptions) (err error) {
 	return nil
 }
 
+// getImageID returns the image ID - the digest of the image config
+func getImageID(resp map[string]string) string {
+	dgst := resp[exptypes.ExporterImageDigestKey]
+	if v, ok := resp[exptypes.ExporterImageConfigDigestKey]; ok {
+		dgst = v
+	}
+	return dgst
+}
+
 func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, options buildOptions, printer *progress.Printer) (*client.SolveResponse, error) {
-	resp, _, err := cbuild.RunBuild(ctx, dockerCli, *opts, os.Stdin, printer, false)
+	resp, res, err := cbuild.RunBuild(ctx, dockerCli, *opts, dockerCli.In(), printer, false)
+	if res != nil {
+		res.Done()
+	}
 	return resp, err
 }
 
@@ -324,7 +346,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 	var retErr error
 	var resp *client.SolveResponse
 	f := ioset.NewSingleForwarder()
-	f.SetReader(os.Stdin)
+	f.SetReader(dockerCli.In())
 	if !options.noBuild {
 		pr, pw := io.Pipe()
 		f.SetWriter(pw, func() io.WriteCloser {
@@ -489,7 +511,7 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 
 	flags.StringArrayVar(&options.attests, "attest", []string{}, `Attestation parameters (format: "type=sbom,generator=image")`)
 	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--attest=type=sbom"`)
-	flags.StringVar(&options.provenance, "provenance", "", `Shortand for "--attest=type=provenance"`)
+	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--attest=type=provenance"`)
 
 	if isExperimental() {
 		flags.StringVar(&invokeFlag, "invoke", "", "Invoke a command after the build [experimental]")
@@ -682,6 +704,7 @@ func parseInvokeConfig(invoke string) (cfg invokeConfig, err error) {
 	}
 
 	csvReader := csv.NewReader(strings.NewReader(invoke))
+	csvReader.LazyQuotes = true
 	fields, err := csvReader.Read()
 	if err != nil {
 		return cfg, err
@@ -701,11 +724,14 @@ func parseInvokeConfig(invoke string) (cfg invokeConfig, err error) {
 		value := parts[1]
 		switch key {
 		case "args":
-			cfg.Cmd = append(cfg.Cmd, value) // TODO: support JSON
+			cfg.Cmd = append(cfg.Cmd, maybeJSONArray(value)...)
 		case "entrypoint":
-			cfg.Entrypoint = append(cfg.Entrypoint, value) // TODO: support JSON
+			cfg.Entrypoint = append(cfg.Entrypoint, maybeJSONArray(value)...)
+			if cfg.Cmd == nil {
+				cfg.Cmd = []string{}
+			}
 		case "env":
-			cfg.Env = append(cfg.Env, value)
+			cfg.Env = append(cfg.Env, maybeJSONArray(value)...)
 		case "user":
 			cfg.User = value
 			cfg.NoUser = false
@@ -722,6 +748,14 @@ func parseInvokeConfig(invoke string) (cfg invokeConfig, err error) {
 		}
 	}
 	return cfg, nil
+}
+
+func maybeJSONArray(v string) []string {
+	var list []string
+	if err := json.Unmarshal([]byte(v), &list); err == nil {
+		return list
+	}
+	return []string{v}
 }
 
 func listToMap(values []string, defaultEnv bool) map[string]string {

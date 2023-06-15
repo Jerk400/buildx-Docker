@@ -24,7 +24,7 @@ build command to specify a command to launch in the resulting image.
 
 ```console
 $ docker buildx build --invoke /bin/sh .
-+] Building 4.2s (19/19) FINISHED
+[+] Building 4.2s (19/19) FINISHED
  => [internal] connecting to local controller                                                                                   0.0s
  => [internal] load build definition from Dockerfile                                                                            0.0s
  => => transferring dockerfile: 32B                                                                                             0.0s
@@ -48,6 +48,57 @@ For example, you can use `ls` to see the contents of the image:
 bin    etc    lib    mnt    proc   run    srv    tmp    var
 dev    home   media  opt    root   sbin   sys    usr    work
 ```
+
+Optional long form allows you specifying detailed configurations of the process. 
+It must be CSV-styled comma-separated key-value pairs.
+Supported keys are `args` (can be JSON array format), `entrypoint` (can be JSON array format), `env` (can be JSON array format), `user`, `cwd` and `tty` (bool).
+
+Example:
+
+```
+$ docker buildx build --invoke 'entrypoint=["sh"],"args=[""-c"", ""env | grep -e FOO -e AAA""]","env=[""FOO=bar"", ""AAA=bbb""]"' .
+```
+
+#### `on-error`
+
+If you want to start a debug session when a build fails, you can use
+`--invoke=on-error` to start a debug session when the build fails.
+
+```console
+$ docker buildx build --invoke on-error .
+[+] Building 4.2s (19/19) FINISHED
+ => [internal] connecting to local controller                                                                                   0.0s
+ => [internal] load build definition from Dockerfile                                                                            0.0s
+ => => transferring dockerfile: 32B                                                                                             0.0s
+ => [internal] load .dockerignore                                                                                               0.0s
+ => => transferring context: 34B                                                                                                0.0s
+ ...
+ => ERROR [shell 10/10] RUN bad-command
+------
+ > [shell 10/10] RUN bad-command:
+#0 0.049 /bin/sh: bad-command: not found
+------
+Launching interactive container. Press Ctrl-a-c to switch to monitor console
+Interactive container was restarted with process "edmzor60nrag7rh1mbi4o9lm8". Press Ctrl-a-c to switch to the new container
+/ # 
+```
+
+This allows you to explore the state of the image when the build failed.
+
+#### `debug-shell`
+
+If you want to drop into a debug session without first starting the build, you
+can use `--invoke=debug-shell` to start a debug session.
+
+```
+$ docker buildx build --invoke debug-shell .
+[+] Building 4.2s (19/19) FINISHED
+ => [internal] connecting to local controller                                                                                   0.0s
+(buildx)
+```
+
+You can then use the commands available in [monitor mode](#monitor-mode) to
+start and observe the build.
 
 ## Monitor mode
 
@@ -93,7 +144,7 @@ immediately enter the monitor mode.
 
 ```console
 $ docker buildx debug-shell
-+] Building 0.0s (1/1) FINISHED                                                                                                                                                                                
+[+] Building 0.0s (1/1) FINISHED                                                                                                                                                                                
  => [internal] connecting to remote controller
 (buildx) list
 ID                              CURRENT_SESSION
