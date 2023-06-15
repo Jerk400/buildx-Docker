@@ -98,7 +98,7 @@ func (m *Manager) DeleteProcess(id string) error {
 // When a container isn't available (i.e. first time invoking or the container has exited) or cfg.Rollback is set,
 // this method will start a new container and run the process in it. Otherwise, this method starts a new process in the
 // existing container.
-func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *pb.InvokeConfig) (*Process, error) {
+func (m *Manager) StartProcess(pid string, resultCtx *build.ResultHandle, cfg *pb.InvokeConfig) (*Process, error) {
 	// Get the target result to invoke a container from
 	var ctr *build.Container
 	if a := m.container.Load(); a != nil {
@@ -111,7 +111,7 @@ func (m *Manager) StartProcess(pid string, resultCtx *build.ResultContext, cfg *
 			go ctr.Cancel() // Finish the existing container
 		}
 		var err error
-		ctr, err = build.NewContainer(context.TODO(), resultCtx)
+		ctr, err = build.NewContainer(context.TODO(), resultCtx, cfg)
 		if err != nil {
 			return nil, errors.Errorf("failed to create container %v", err)
 		}

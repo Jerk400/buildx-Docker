@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"text/tabwriter"
@@ -13,34 +12,30 @@ import (
 	"github.com/containerd/console"
 	"github.com/docker/buildx/controller/control"
 	controllerapi "github.com/docker/buildx/controller/pb"
+	"github.com/docker/buildx/monitor/commands"
+	"github.com/docker/buildx/monitor/types"
 	"github.com/docker/buildx/util/ioset"
+	"github.com/docker/buildx/util/progress"
+	"github.com/google/shlex"
 	"github.com/moby/buildkit/identity"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 )
 
-const helpMessage = `
-Available commands are:
-  reload     reloads the context and build it.
-  rollback   re-runs the interactive container with initial rootfs contents.
-  list       list buildx sessions.
-  attach     attach to a buildx server or a process in the container.
-  exec       execute a process in the interactive container.
-  ps         list processes invoked by "exec". Use "attach" to attach IO to that process.
-  disconnect disconnect a client from a buildx server. Specific session ID can be specified an arg.
-  kill       kill buildx server.
-  exit       exits monitor.
-  help       shows this message.
-`
-
 // RunMonitor provides an interactive session for running and managing containers via specified IO.
-func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildOptions, invokeConfig controllerapi.InvokeConfig, c control.BuildxController, progressMode string, stdin io.ReadCloser, stdout io.WriteCloser, stderr console.File) error {
+func RunMonitor(ctx context.Context, curRef string, options *controllerapi.BuildOptions, invokeConfig controllerapi.InvokeConfig, c control.BuildxController, stdin io.ReadCloser, stdout io.WriteCloser, stderr console.File, progress *progress.Printer) error {
 	defer func() {
 		if err := c.Disconnect(ctx, curRef); err != nil {
 			logrus.Warnf("disconnect error: %v", err)
 		}
 	}()
+
+	if err := progress.Pause(); err != nil {
+		return err
+	}
+	defer progress.Unpause()
+
 	monitorIn, monitorOut := ioset.Pipe()
 	defer func() {
 		monitorIn.Close()
@@ -67,7 +62,8 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 	invokeForwarder := ioset.NewForwarder()
 	invokeForwarder.SetIn(&containerIn)
 	m := &monitor{
-		invokeIO: invokeForwarder,
+		BuildxController: c,
+		invokeIO:         invokeForwarder,
 		muxIO: ioset.NewMuxIO(ioset.In{
 			Stdin:  io.NopCloser(stdin),
 			Stdout: nopCloser{stdout},
@@ -79,13 +75,34 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 			}
 			return "Switched IO\n"
 		}),
-		invokeFunc: c.Invoke,
 	}
+	m.ref.Store(curRef)
 
 	// Start container automatically
 	fmt.Fprintf(stdout, "Launching interactive container. Press Ctrl-a-c to switch to monitor console\n")
-	id := m.rollback(ctx, curRef, invokeConfig)
+	invokeConfig.Rollback = false
+	invokeConfig.Initial = false
+	id := m.Rollback(ctx, invokeConfig)
 	fmt.Fprintf(stdout, "Interactive container was restarted with process %q. Press Ctrl-a-c to switch to the new container\n", id)
+
+	availableCommands := []types.Command{
+		commands.NewReloadCmd(m, stdout, progress, options, invokeConfig),
+		commands.NewRollbackCmd(m, invokeConfig, stdout),
+		commands.NewListCmd(m, stdout),
+		commands.NewDisconnectCmd(m),
+		commands.NewKillCmd(m),
+		commands.NewAttachCmd(m, stdout),
+		commands.NewExecCmd(m, invokeConfig, stdout),
+		commands.NewPsCmd(m, stdout),
+	}
+	registeredCommands := make(map[string]types.Command)
+	for _, c := range availableCommands {
+		registeredCommands[c.Info().Name] = c
+	}
+	additionalHelpMessages := map[string]string{
+		"help": "shows this message. Optionally pass a command name as an argument to print the detailed usage.",
+		"exit": "exits monitor",
+	}
 
 	// Serve monitor commands
 	monitorForwarder := ioset.NewForwarder()
@@ -112,157 +129,95 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 					}
 					return
 				}
-				args := strings.Fields(l) // TODO: use shlex
-				if len(args) == 0 {
+				args, err := shlex.Split(l)
+				if err != nil {
+					fmt.Fprintf(stdout, "monitor: failed to parse command: %v", err)
+					continue
+				} else if len(args) == 0 {
 					continue
 				}
+
+				// Builtin commands
 				switch args[0] {
 				case "":
 					// nop
-				case "reload":
-					if curRef != "" {
-						if err := c.Disconnect(ctx, curRef); err != nil {
-							fmt.Println("disconnect error", err)
-						}
-					}
-					ref, _, err := c.Build(ctx, options, nil, stdout, stderr, progressMode) // TODO: support stdin, hold build ref
-					if err != nil {
-						fmt.Printf("failed to reload: %v\n", err)
-					} else {
-						curRef = ref
-						// rollback the running container with the new result
-						id := m.rollback(ctx, curRef, invokeConfig)
-						fmt.Fprintf(stdout, "Interactive container was restarted with process %q. Press Ctrl-a-c to switch to the new container\n", id)
-					}
-				case "rollback":
-					cfg := invokeConfig
-					if len(args) >= 2 {
-						cfg.Entrypoint = []string{args[1]}
-						cfg.Cmd = args[2:]
-					}
-					id := m.rollback(ctx, curRef, cfg)
-					fmt.Fprintf(stdout, "Interactive container was restarted with process %q. Press Ctrl-a-c to switch to the new container\n", id)
-				case "list":
-					refs, err := c.List(ctx)
-					if err != nil {
-						fmt.Printf("failed to list: %v\n", err)
-					}
-					sort.Strings(refs)
-					tw := tabwriter.NewWriter(stdout, 1, 8, 1, '\t', 0)
-					fmt.Fprintln(tw, "ID\tCURRENT_SESSION")
-					for _, k := range refs {
-						fmt.Fprintf(tw, "%-20s\t%v\n", k, k == curRef)
-					}
-					tw.Flush()
-				case "disconnect":
-					target := curRef
-					if len(args) >= 2 {
-						target = args[1]
-					}
-					isProcess, err := isProcessID(ctx, c, curRef, target)
-					if err == nil && isProcess {
-						if err := c.DisconnectProcess(ctx, curRef, target); err != nil {
-							fmt.Printf("disconnect process failed %v\n", target)
-							continue
-						}
-						continue
-					}
-					if err := c.Disconnect(ctx, target); err != nil {
-						fmt.Println("disconnect error", err)
-					}
-				case "kill":
-					if err := c.Kill(ctx); err != nil {
-						fmt.Printf("failed to kill: %v\n", err)
-					}
-				case "attach":
-					if len(args) < 2 {
-						fmt.Println("attach: server name must be passed")
-						continue
-					}
-					ref := args[1]
-					var id string
-
-					isProcess, err := isProcessID(ctx, c, curRef, ref)
-					if err == nil && isProcess {
-						m.attach(ctx, curRef, ref)
-						id = ref
-					}
-					if id == "" {
-						refs, err := c.List(ctx)
-						if err != nil {
-							fmt.Printf("failed to get the list of sessions: %v\n", err)
-							continue
-						}
-						found := false
-						for _, s := range refs {
-							if s == ref {
-								found = true
-								break
-							}
-						}
-						if !found {
-							fmt.Printf("unknown ID: %q\n", ref)
-							continue
-						}
-						if m.invokeCancel != nil {
-							m.invokeCancel() // Finish existing attach
-						}
-						curRef = ref
-					}
-					fmt.Fprintf(stdout, "Attached to process %q. Press Ctrl-a-c to switch to the new container\n", id)
-				case "exec":
-					if len(args) < 2 {
-						fmt.Println("exec: server name must be passed")
-						continue
-					}
-					if curRef == "" {
-						fmt.Println("attach to a session first")
-						continue
-					}
-					cfg := controllerapi.InvokeConfig{
-						Entrypoint: []string{args[1]},
-						Cmd:        args[2:],
-						// TODO: support other options as well via flags
-						Env:  invokeConfig.Env,
-						User: invokeConfig.User,
-						Cwd:  invokeConfig.Cwd,
-						Tty:  true,
-					}
-					pid := m.exec(ctx, curRef, cfg)
-					fmt.Fprintf(stdout, "Process %q started. Press Ctrl-a-c to switch to that process.\n", pid)
-				case "ps":
-					plist, err := c.ListProcesses(ctx, curRef)
-					if err != nil {
-						fmt.Println("cannot list process:", err)
-						continue
-					}
-					tw := tabwriter.NewWriter(stdout, 1, 8, 1, '\t', 0)
-					fmt.Fprintln(tw, "PID\tCURRENT_SESSION\tCOMMAND")
-					for _, p := range plist {
-						fmt.Fprintf(tw, "%-20s\t%v\t%v\n", p.ProcessID, p.ProcessID == m.attachedPid.Load(), append(p.InvokeConfig.Entrypoint, p.InvokeConfig.Cmd...))
-					}
-					tw.Flush()
+					continue
 				case "exit":
 					return
 				case "help":
-					fmt.Fprint(stdout, helpMessage)
+					if len(args) >= 2 {
+						printHelpMessageOfCommand(stdout, args[1], registeredCommands, additionalHelpMessages)
+						continue
+					}
+					printHelpMessage(stdout, registeredCommands, additionalHelpMessages)
+					continue
 				default:
-					fmt.Printf("unknown command: %q\n", l)
-					fmt.Fprint(stdout, helpMessage)
+				}
+
+				// Registered commands
+				cmdname := args[0]
+				if cm, ok := registeredCommands[cmdname]; ok {
+					if err := cm.Exec(ctx, args); err != nil {
+						fmt.Fprintf(stdout, "%s: %v\n", cmdname, err)
+					}
+				} else {
+					fmt.Fprintf(stdout, "monitor: unknown command: %q\n", l)
+					printHelpMessage(stdout, registeredCommands, additionalHelpMessages)
 				}
 			}
 		}()
 		select {
 		case <-doneCh:
-			m.invokeCancel()
+			m.close()
 			return nil
 		case err := <-errCh:
-			m.invokeCancel()
+			m.close()
 			return err
 		case <-monitorDisableCh:
 		}
 		monitorForwarder.SetOut(nil)
 	}
+}
+
+func printHelpMessageOfCommand(out io.Writer, name string, registeredCommands map[string]types.Command, additional map[string]string) {
+	var target types.Command
+	if c, ok := registeredCommands[name]; ok {
+		target = c
+	} else {
+		fmt.Fprintf(out, "monitor: no help message for %q\n", name)
+		printHelpMessage(out, registeredCommands, additional)
+		return
+	}
+	fmt.Fprintln(out, target.Info().HelpMessage)
+	if h := target.Info().HelpMessageLong; h != "" {
+		fmt.Fprintln(out, h)
+	}
+}
+
+func printHelpMessage(out io.Writer, registeredCommands map[string]types.Command, additional map[string]string) {
+	var names []string
+	for name := range registeredCommands {
+		names = append(names, name)
+	}
+	for name := range additional {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprint(out, "Available commands are:\n")
+	w := new(tabwriter.Writer)
+	w.Init(out, 0, 8, 0, '\t', 0)
+	for _, name := range names {
+		var mes string
+		if c, ok := registeredCommands[name]; ok {
+			mes = c.Info().HelpMessage
+		} else if m, ok := additional[name]; ok {
+			mes = m
+		} else {
+			continue
+		}
+		fmt.Fprintln(w, "  "+name+"\t"+mes)
+	}
+	w.Flush()
 }
 
 type readWriter struct {
@@ -271,35 +226,67 @@ type readWriter struct {
 }
 
 type monitor struct {
+	control.BuildxController
+	ref atomic.Value
+
 	muxIO        *ioset.MuxIO
 	invokeIO     *ioset.Forwarder
-	invokeFunc   func(ctx context.Context, ref, pid string, cfg controllerapi.InvokeConfig, in io.ReadCloser, out io.WriteCloser, err io.WriteCloser) error
 	invokeCancel func()
 	attachedPid  atomic.Value
 }
 
-func (m *monitor) rollback(ctx context.Context, ref string, cfg controllerapi.InvokeConfig) string {
+func (m *monitor) DisconnectSession(ctx context.Context, targetID string) error {
+	return m.Disconnect(ctx, targetID)
+}
+
+func (m *monitor) AttachSession(ref string) {
+	m.ref.Store(ref)
+}
+
+func (m *monitor) AttachedSessionID() string {
+	return m.ref.Load().(string)
+}
+
+func (m *monitor) Rollback(ctx context.Context, cfg controllerapi.InvokeConfig) string {
 	pid := identity.NewID()
 	cfg1 := cfg
 	cfg1.Rollback = true
-	return m.startInvoke(ctx, ref, pid, cfg1)
+	return m.startInvoke(ctx, pid, cfg1)
 }
 
-func (m *monitor) exec(ctx context.Context, ref string, cfg controllerapi.InvokeConfig) string {
-	return m.startInvoke(ctx, ref, identity.NewID(), cfg)
+func (m *monitor) Exec(ctx context.Context, cfg controllerapi.InvokeConfig) string {
+	return m.startInvoke(ctx, identity.NewID(), cfg)
 }
 
-func (m *monitor) attach(ctx context.Context, ref, pid string) {
-	m.startInvoke(ctx, ref, pid, controllerapi.InvokeConfig{})
+func (m *monitor) Attach(ctx context.Context, pid string) {
+	m.startInvoke(ctx, pid, controllerapi.InvokeConfig{})
 }
 
-func (m *monitor) startInvoke(ctx context.Context, ref, pid string, cfg controllerapi.InvokeConfig) string {
+func (m *monitor) Detach() {
 	if m.invokeCancel != nil {
 		m.invokeCancel() // Finish existing attach
 	}
+}
+
+func (m *monitor) AttachedPID() string {
+	return m.attachedPid.Load().(string)
+}
+
+func (m *monitor) close() {
+	m.Detach()
+}
+
+func (m *monitor) startInvoke(ctx context.Context, pid string, cfg controllerapi.InvokeConfig) string {
+	if m.invokeCancel != nil {
+		m.invokeCancel() // Finish existing attach
+	}
+	if len(cfg.Entrypoint) == 0 && len(cfg.Cmd) == 0 {
+		cfg.Entrypoint = []string{"sh"} // launch shell by default
+		cfg.Cmd = []string{}
+	}
 	go func() {
 		// Start a new invoke
-		if err := m.invoke(ctx, ref, pid, cfg); err != nil {
+		if err := m.invoke(ctx, pid, cfg); err != nil {
 			logrus.Debugf("invoke error: %v", err)
 		}
 		if pid == m.attachedPid.Load() {
@@ -310,11 +297,14 @@ func (m *monitor) startInvoke(ctx context.Context, ref, pid string, cfg controll
 	return pid
 }
 
-func (m *monitor) invoke(ctx context.Context, ref, pid string, cfg controllerapi.InvokeConfig) error {
+func (m *monitor) invoke(ctx context.Context, pid string, cfg controllerapi.InvokeConfig) error {
 	m.muxIO.Enable(1)
 	defer m.muxIO.Disable(1)
 	if err := m.muxIO.SwitchTo(1); err != nil {
 		return errors.Errorf("failed to switch to process IO: %v", err)
+	}
+	if m.AttachedSessionID() == "" {
+		return nil
 	}
 	invokeCtx, invokeCancel := context.WithCancel(ctx)
 
@@ -333,7 +323,7 @@ func (m *monitor) invoke(ctx context.Context, ref, pid string, cfg controllerapi
 	defer invokeCancelAndDetachFn()
 	m.invokeCancel = invokeCancelAndDetachFn
 
-	err := m.invokeFunc(invokeCtx, ref, pid, cfg, containerIn.Stdin, containerIn.Stdout, containerIn.Stderr)
+	err := m.Invoke(invokeCtx, m.AttachedSessionID(), pid, cfg, containerIn.Stdin, containerIn.Stdout, containerIn.Stderr)
 	close(waitInvokeDoneCh)
 
 	return err
@@ -344,16 +334,3 @@ type nopCloser struct {
 }
 
 func (c nopCloser) Close() error { return nil }
-
-func isProcessID(ctx context.Context, c control.BuildxController, curRef, ref string) (bool, error) {
-	infos, err := c.ListProcesses(ctx, curRef)
-	if err != nil {
-		return false, err
-	}
-	for _, p := range infos {
-		if p.ProcessID == ref {
-			return true, nil
-		}
-	}
-	return false, nil
-}

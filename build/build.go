@@ -25,6 +25,8 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/driver"
+	"github.com/docker/buildx/localstate"
+	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/buildx/util/progress"
@@ -45,6 +47,7 @@ import (
 	"github.com/moby/buildkit/session/upload/uploadprovider"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
+	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/progress/progresswriter"
@@ -63,7 +66,7 @@ var (
 )
 
 const (
-	printFallbackImage = "docker/dockerfile-upstream:1.4-outline@sha256:627443ff4e2d0f635d429cfc1da5388bcd5a70949c38adcd3cd7c4e5df67c73c"
+	printFallbackImage = "docker/dockerfile:1.5.2-labs@sha256:f2e91734a84c0922ff47aa4098ab775f1dfa932430d2888dd5cad5251fafdac4"
 )
 
 type Options struct {
@@ -91,8 +94,9 @@ type Options struct {
 	Session []session.Attachable
 
 	// Linked marks this target as exclusively linked (not requested by the user).
-	Linked    bool
-	PrintFunc *PrintFunc
+	Linked       bool
+	PrintFunc    *PrintFunc
+	SourcePolicy *spb.Policy
 }
 
 type PrintFunc struct {
@@ -360,7 +364,7 @@ func toRepoOnly(in string) (string, error) {
 	return strings.Join(out, ","), nil
 }
 
-func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Options, bopts gateway.BuildOpts, configDir string, pw progress.Writer, dl dockerLoadCallback) (solveOpt *client.SolveOpt, release func(), err error) {
+func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Options, bopts gateway.BuildOpts, configDir string, pw progress.Writer, docker *dockerutil.Client) (solveOpt *client.SolveOpt, release func(), err error) {
 	nodeDriver := node.Driver
 	defers := make([]func(), 0, 2)
 	releaseF := func() {
@@ -386,7 +390,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 	}
 
 	for _, e := range opt.CacheTo {
-		if e.Type != "inline" && !nodeDriver.Features()[driver.CacheExport] {
+		if e.Type != "inline" && !nodeDriver.Features(ctx)[driver.CacheExport] {
 			return nil, nil, notSupported(nodeDriver, driver.CacheExport)
 		}
 	}
@@ -426,6 +430,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		CacheExports:        cacheTo,
 		CacheImports:        cacheFrom,
 		AllowedEntitlements: opt.Allow,
+		SourcePolicy:        opt.SourcePolicy,
 	}
 
 	if opt.CgroupParent != "" {
@@ -523,25 +528,33 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 
 	// set up exporters
 	for i, e := range opt.Exports {
-		if e.Type == "oci" && !nodeDriver.Features()[driver.OCIExporter] {
+		if e.Type == "oci" && !nodeDriver.Features(ctx)[driver.OCIExporter] {
 			return nil, nil, notSupported(nodeDriver, driver.OCIExporter)
 		}
 		if e.Type == "docker" {
-			if len(opt.Platforms) > 1 || len(attests) > 0 {
+			features := docker.Features(ctx, e.Attrs["context"])
+			if features[dockerutil.OCIImporter] && e.Output == nil {
+				// rely on oci importer if available (which supports
+				// multi-platform images), otherwise fall back to docker
+				opt.Exports[i].Type = "oci"
+			} else if len(opt.Platforms) > 1 || len(attests) > 0 {
+				if e.Output != nil {
+					return nil, nil, errors.Errorf("docker exporter does not support exporting manifest lists, use the oci exporter instead")
+				}
 				return nil, nil, errors.Errorf("docker exporter does not currently support exporting manifest lists")
 			}
 			if e.Output == nil {
 				if nodeDriver.IsMobyDriver() {
 					e.Type = "image"
 				} else {
-					w, cancel, err := dl(e.Attrs["context"])
+					w, cancel, err := docker.LoadImage(ctx, e.Attrs["context"], pw)
 					if err != nil {
 						return nil, nil, err
 					}
 					defers = append(defers, cancel)
 					opt.Exports[i].Output = wrapWriteCloser(w)
 				}
-			} else if !nodeDriver.Features()[driver.DockerExporter] {
+			} else if !nodeDriver.Features(ctx)[driver.DockerExporter] {
 				return nil, nil, notSupported(nodeDriver, driver.DockerExporter)
 			}
 		}
@@ -610,7 +623,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		for i, p := range opt.Platforms {
 			pp[i] = platforms.Format(p)
 		}
-		if len(pp) > 1 && !nodeDriver.Features()[driver.MultiPlatform] {
+		if len(pp) > 1 && !nodeDriver.Features(ctx)[driver.MultiPlatform] {
 			return nil, nil, notSupported(nodeDriver, driver.MultiPlatform)
 		}
 		so.FrontendAttrs["platform"] = strings.Join(pp, ",")
@@ -650,6 +663,12 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 		so.FrontendAttrs["ulimit"] = ulimits
 	}
 
+	// remember local state like directory path that is not sent to buildkit
+	so.Ref = identity.NewID()
+	if err := saveLocalState(so, opt, node, configDir); err != nil {
+		return nil, nil, err
+	}
+
 	return &so, releaseF, nil
 }
 
@@ -657,7 +676,7 @@ func Build(ctx context.Context, nodes []builder.Node, opt map[string]Options, do
 	return BuildWithResultHandler(ctx, nodes, opt, docker, configDir, w, nil)
 }
 
-func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer, resultHandleFunc func(driverIndex int, rCtx *ResultContext)) (resp map[string]*client.SolveResponse, err error) {
+func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer, resultHandleFunc func(driverIndex int, rCtx *ResultHandle)) (resp map[string]*client.SolveResponse, err error) {
 	if len(nodes) == 0 {
 		return nil, errors.Errorf("driver required for build")
 	}
@@ -723,9 +742,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 				hasMobyDriver = true
 			}
 			opt.Platforms = np.platforms
-			so, release, err := toSolveOpt(ctx, node, multiDriver, opt, np.bopts, configDir, w, func(name string) (io.WriteCloser, func(), error) {
-				return docker.LoadImage(ctx, name, w)
-			})
+			so, release, err := toSolveOpt(ctx, node, multiDriver, opt, np.bopts, configDir, w, docker)
 			if err != nil {
 				return nil, err
 			}
@@ -812,6 +829,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 
 			for i, dp := range dps {
 				i, dp, so := i, dp, *dp.so
+				node := nodes[dp.driverIndex]
 				if multiDriver {
 					for i, e := range so.Exports {
 						switch e.Type {
@@ -875,56 +893,71 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 
 					cc := c
 					var printRes map[string][]byte
-					rr, err := c.Build(ctx, so, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
-						var isFallback bool
-						var origErr error
-						for {
-							if opt.PrintFunc != nil {
-								if _, ok := req.FrontendOpt["frontend.caps"]; !ok {
-									req.FrontendOpt["frontend.caps"] = "moby.buildkit.frontend.subrequests+forward"
-								} else {
-									req.FrontendOpt["frontend.caps"] += ",moby.buildkit.frontend.subrequests+forward"
-								}
-								req.FrontendOpt["requestid"] = "frontend." + opt.PrintFunc.Name
-								if isFallback {
-									req.FrontendOpt["build-arg:BUILDKIT_SYNTAX"] = printFallbackImage
-								}
+					buildFunc := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+						if opt.PrintFunc != nil {
+							if _, ok := req.FrontendOpt["frontend.caps"]; !ok {
+								req.FrontendOpt["frontend.caps"] = "moby.buildkit.frontend.subrequests+forward"
+							} else {
+								req.FrontendOpt["frontend.caps"] += ",moby.buildkit.frontend.subrequests+forward"
 							}
-							res, err := c.Solve(ctx, req)
-							if err != nil {
-								if origErr != nil {
+							req.FrontendOpt["requestid"] = "frontend." + opt.PrintFunc.Name
+						}
+
+						res, err := c.Solve(ctx, req)
+						if err != nil {
+							fallback := false
+							var reqErr *errdefs.UnsupportedSubrequestError
+							if errors.As(err, &reqErr) {
+								switch reqErr.Name {
+								case "frontend.outline", "frontend.targets":
+									fallback = true
+								default:
 									return nil, err
 								}
-								var reqErr *errdefs.UnsupportedSubrequestError
-								if !isFallback {
-									if errors.As(err, &reqErr) {
-										switch reqErr.Name {
-										case "frontend.outline", "frontend.targets":
-											isFallback = true
-											origErr = err
-											continue
-										}
-										return nil, err
-									}
-									// buildkit v0.8 vendored in Docker 20.10 does not support typed errors
-									if strings.Contains(err.Error(), "unsupported request frontend.outline") || strings.Contains(err.Error(), "unsupported request frontend.targets") {
-										isFallback = true
-										origErr = err
-										continue
-									}
-								}
+							} else {
 								return nil, err
 							}
-							if opt.PrintFunc != nil {
-								printRes = res.Metadata
+							// buildkit v0.8 vendored in Docker 20.10 does not support typed errors
+							if strings.Contains(err.Error(), "unsupported request frontend.outline") || strings.Contains(err.Error(), "unsupported request frontend.targets") {
+								fallback = true
 							}
-							results.Set(resultKey(dp.driverIndex, k), res)
-							if resultHandleFunc != nil {
-								resultHandleFunc(dp.driverIndex, &ResultContext{cc, res})
+
+							if fallback {
+								req.FrontendOpt["build-arg:BUILDKIT_SYNTAX"] = printFallbackImage
+								res2, err2 := c.Solve(ctx, req)
+								if err2 != nil {
+									return nil, err
+								}
+								res = res2
+							} else {
+								return nil, err
 							}
-							return res, nil
 						}
-					}, ch)
+						if opt.PrintFunc != nil {
+							printRes = res.Metadata
+						}
+
+						results.Set(resultKey(dp.driverIndex, k), res)
+						return res, nil
+					}
+					var rr *client.SolveResponse
+					if resultHandleFunc != nil {
+						var resultHandle *ResultHandle
+						resultHandle, rr, err = NewResultHandle(ctx, cc, so, "buildx", buildFunc, ch)
+						resultHandleFunc(dp.driverIndex, resultHandle)
+					} else {
+						rr, err = c.Build(ctx, so, "buildx", buildFunc, ch)
+					}
+					if desktop.BuildBackendEnabled() && node.Driver.HistoryAPISupported(ctx) {
+						buildRef := fmt.Sprintf("%s/%s/%s", node.Builder, node.Name, so.Ref)
+						if err != nil {
+							return &desktop.ErrorWithBuildRef{
+								Ref: buildRef,
+								Err: err,
+							}
+						}
+						progress.WriteBuildRef(w, k, buildRef)
+					}
 					if err != nil {
 						return err
 					}
@@ -1229,7 +1262,7 @@ func createTempDockerfile(r io.Reader) (string, error) {
 	return dir, err
 }
 
-func LoadInputs(ctx context.Context, d driver.Driver, inp Inputs, pw progress.Writer, target *client.SolveOpt) (func(), error) {
+func LoadInputs(ctx context.Context, d *driver.DriverHandle, inp Inputs, pw progress.Writer, target *client.SolveOpt) (func(), error) {
 	if inp.ContextPath == "" {
 		return nil, errors.New("please specify build context (e.g. \".\" for the current directory)")
 	}
@@ -1528,8 +1561,6 @@ func notSupported(d driver.Driver, f driver.Feature) error {
 	return errors.Errorf("%s feature is currently not supported for %s driver. Please switch to a different driver (eg. \"docker buildx create --use\")", f, d.Factory().Name())
 }
 
-type dockerLoadCallback func(name string) (io.WriteCloser, func(), error)
-
 func noDefaultLoad() bool {
 	v, ok := os.LookupEnv("BUILDX_NO_DEFAULT_LOAD")
 	if !ok {
@@ -1611,4 +1642,66 @@ func noPrintFunc(opt map[string]Options) bool {
 		}
 	}
 	return true
+}
+
+func saveLocalState(so client.SolveOpt, opt Options, node builder.Node, configDir string) error {
+	var err error
+
+	if so.Ref == "" {
+		return nil
+	}
+
+	lp := opt.Inputs.ContextPath
+	dp := opt.Inputs.DockerfilePath
+	if lp != "" || dp != "" {
+		if lp != "" {
+			lp, err = filepath.Abs(lp)
+			if err != nil {
+				return err
+			}
+		}
+		if dp != "" {
+			dp, err = filepath.Abs(dp)
+			if err != nil {
+				return err
+			}
+		}
+		ls, err := localstate.New(configDir)
+		if err != nil {
+			return err
+		}
+		if err := ls.SaveRef(node.Builder, node.Name, so.Ref, localstate.State{
+			LocalPath:      lp,
+			DockerfilePath: dp,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ReadSourcePolicy reads a source policy from a file.
+// The file path is taken from EXPERIMENTAL_BUILDKIT_SOURCE_POLICY env var.
+// if the env var is not set, this `returns nil, nil`
+func ReadSourcePolicy() (*spb.Policy, error) {
+	p := os.Getenv("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY")
+	if p == "" {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read policy file")
+	}
+	var pol spb.Policy
+	if err := json.Unmarshal(data, &pol); err != nil {
+		// maybe it's in protobuf format?
+		e2 := pol.Unmarshal(data)
+		if e2 != nil {
+			return nil, errors.Wrap(err, "failed to parse source policy")
+		}
+	}
+
+	return &pol, nil
 }

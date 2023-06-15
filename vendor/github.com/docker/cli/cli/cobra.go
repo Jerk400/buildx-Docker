@@ -204,6 +204,16 @@ func DisableFlagsInUseLine(cmd *cobra.Command) {
 	})
 }
 
+// HasCompletionArg returns true if a cobra completion arg request is found.
+func HasCompletionArg(args []string) bool {
+	for _, arg := range args {
+		if arg == cobra.ShellCompRequestCmd || arg == cobra.ShellCompNoDescRequestCmd {
+			return true
+		}
+	}
+	return false
+}
+
 var helpCommand = &cobra.Command{
 	Use:               "help [command]",
 	Short:             "Help about the command",
@@ -416,7 +426,7 @@ func invalidPluginReason(cmd *cobra.Command) string {
 	return cmd.Annotations[pluginmanager.CommandAnnotationPluginInvalid]
 }
 
-var usageTemplate = `Usage:
+const usageTemplate = `Usage:
 
 {{- if not .HasSubCommands}}  {{.UseLine}}{{end}}
 {{- if .HasSubCommands}}  {{ .CommandPath}}{{- if .HasAvailableFlags}} [OPTIONS]{{end}} COMMAND{{end}}
@@ -515,5 +525,5 @@ Run '{{.CommandPath}} COMMAND --help' for more information on a command.
 {{- end}}
 `
 
-var helpTemplate = `
+const helpTemplate = `
 {{if or .Runnable .HasSubCommands}}{{.UsageString}}{{end}}`

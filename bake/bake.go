@@ -12,11 +12,13 @@ import (
 	"strconv"
 	"strings"
 
+	composecli "github.com/compose-spec/compose-go/cli"
 	"github.com/docker/buildx/bake/hclparser"
 	"github.com/docker/buildx/build"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/platformutil"
+
 	"github.com/docker/cli/cli/config"
 	hcl "github.com/hashicorp/hcl/v2"
 	"github.com/moby/buildkit/client/llb"
@@ -27,9 +29,6 @@ import (
 )
 
 var (
-	httpPrefix                   = regexp.MustCompile(`^https?://`)
-	gitURLPathWithFragmentSuffix = regexp.MustCompile(`\.git(?:#.+)?$`)
-
 	validTargetNameChars = `[a-zA-Z0-9_-]+`
 	targetNamePattern    = regexp.MustCompile(`^` + validTargetNameChars + `$`)
 )
@@ -45,17 +44,18 @@ type Override struct {
 }
 
 func defaultFilenames() []string {
-	return []string{
-		"docker-compose.yml",  // support app
-		"docker-compose.yaml", // support app
+	names := []string{}
+	names = append(names, composecli.DefaultFileNames...)
+	names = append(names, []string{
 		"docker-bake.json",
 		"docker-bake.override.json",
 		"docker-bake.hcl",
 		"docker-bake.override.hcl",
-	}
+	}...)
+	return names
 }
 
-func ReadLocalFiles(names []string) ([]File, error) {
+func ReadLocalFiles(names []string, stdin io.Reader) ([]File, error) {
 	isDefault := false
 	if len(names) == 0 {
 		isDefault = true
@@ -67,7 +67,7 @@ func ReadLocalFiles(names []string) ([]File, error) {
 		var dt []byte
 		var err error
 		if n == "-" {
-			dt, err = io.ReadAll(os.Stdin)
+			dt, err = io.ReadAll(stdin)
 			if err != nil {
 				return nil, err
 			}
@@ -83,6 +83,21 @@ func ReadLocalFiles(names []string) ([]File, error) {
 		out = append(out, File{Name: n, Data: dt})
 	}
 	return out, nil
+}
+
+func ListTargets(files []File) ([]string, error) {
+	c, err := ParseFiles(files, nil)
+	if err != nil {
+		return nil, err
+	}
+	var targets []string
+	for _, g := range c.Groups {
+		targets = append(targets, g.Name)
+	}
+	for _, t := range c.Targets {
+		targets = append(targets, t.Name)
+	}
+	return dedupSlice(targets), nil
 }
 
 func ReadTargets(ctx context.Context, files []File, targets, overrides []string, defaults map[string]string) (map[string]*Target, map[string]*Group, error) {
@@ -593,7 +608,7 @@ type Target struct {
 	NoCache          *bool              `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
 	NetworkMode      *string            `json:"-" hcl:"-" cty:"-"`
 	NoCacheFilter    []string           `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
-	// IMPORTANT: if you add more fields here, do not forget to update newOverrides and docs/manuals/bake/file-definition.md.
+	// IMPORTANT: if you add more fields here, do not forget to update newOverrides and docs/bake-reference.md.
 
 	// linked is a private field to mark a target used as a linked one
 	linked bool
@@ -605,7 +620,7 @@ var _ hclparser.WithEvalContexts = &Group{}
 var _ hclparser.WithGetName = &Group{}
 
 func (t *Target) normalize() {
-	t.Attest = removeDupes(t.Attest)
+	t.Attest = removeAttestDupes(t.Attest)
 	t.Tags = removeDupes(t.Tags)
 	t.Secrets = removeDupes(t.Secrets)
 	t.SSH = removeDupes(t.SSH)
@@ -667,6 +682,7 @@ func (t *Target) Merge(t2 *Target) {
 	}
 	if t2.Attest != nil { // merge
 		t.Attest = append(t.Attest, t2.Attest...)
+		t.Attest = removeAttestDupes(t.Attest)
 	}
 	if t2.Secrets != nil { // merge
 		t.Secrets = append(t.Secrets, t2.Secrets...)
@@ -936,7 +952,12 @@ func updateContext(t *build.Inputs, inp *Input) {
 	if build.IsRemoteURL(t.ContextPath) {
 		return
 	}
-	st := llb.Scratch().File(llb.Copy(*inp.State, t.ContextPath, "/"), llb.WithCustomNamef("set context to %s", t.ContextPath))
+	st := llb.Scratch().File(
+		llb.Copy(*inp.State, t.ContextPath, "/", &llb.CopyInfo{
+			CopyDirContentsOnly: true,
+		}),
+		llb.WithCustomNamef("set context to %s", t.ContextPath),
+	)
 	t.ContextState = &st
 }
 
@@ -979,6 +1000,10 @@ func checkPath(p string) error {
 		}
 		return err
 	}
+	p, err = filepath.Abs(p)
+	if err != nil {
+		return err
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -987,7 +1012,8 @@ func checkPath(p string) error {
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if parts[0] == ".." {
 		return errors.Errorf("path %s is outside of the working directory, please set BAKE_ALLOW_REMOTE_FS_ACCESS=1", p)
 	}
 	return nil
@@ -1013,9 +1039,32 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		dockerfilePath = *t.Dockerfile
 	}
 
-	if !build.IsRemoteURL(contextPath) && !path.IsAbs(dockerfilePath) {
-		dockerfilePath = path.Join(contextPath, dockerfilePath)
+	bi := build.Inputs{
+		ContextPath:    contextPath,
+		DockerfilePath: dockerfilePath,
+		NamedContexts:  toNamedContexts(t.Contexts),
 	}
+	if t.DockerfileInline != nil {
+		bi.DockerfileInline = *t.DockerfileInline
+	}
+	updateContext(&bi, inp)
+	if !build.IsRemoteURL(bi.ContextPath) && bi.ContextState == nil && !path.IsAbs(bi.DockerfilePath) {
+		bi.DockerfilePath = path.Join(bi.ContextPath, bi.DockerfilePath)
+	}
+	if strings.HasPrefix(bi.ContextPath, "cwd://") {
+		bi.ContextPath = path.Clean(strings.TrimPrefix(bi.ContextPath, "cwd://"))
+	}
+	for k, v := range bi.NamedContexts {
+		if strings.HasPrefix(v.Path, "cwd://") {
+			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
+		}
+	}
+
+	if err := validateContextsEntitlements(bi, inp); err != nil {
+		return nil, err
+	}
+
+	t.Context = &bi.ContextPath
 
 	args := map[string]string{}
 	for k, v := range t.Args {
@@ -1045,30 +1094,6 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if t.NetworkMode != nil {
 		networkMode = *t.NetworkMode
 	}
-
-	bi := build.Inputs{
-		ContextPath:    contextPath,
-		DockerfilePath: dockerfilePath,
-		NamedContexts:  toNamedContexts(t.Contexts),
-	}
-	if t.DockerfileInline != nil {
-		bi.DockerfileInline = *t.DockerfileInline
-	}
-	updateContext(&bi, inp)
-	if strings.HasPrefix(bi.ContextPath, "cwd://") {
-		bi.ContextPath = path.Clean(strings.TrimPrefix(bi.ContextPath, "cwd://"))
-	}
-	for k, v := range bi.NamedContexts {
-		if strings.HasPrefix(v.Path, "cwd://") {
-			bi.NamedContexts[k] = build.NamedContext{Path: path.Clean(strings.TrimPrefix(v.Path, "cwd://"))}
-		}
-	}
-
-	if err := validateContextsEntitlements(bi, inp); err != nil {
-		return nil, err
-	}
-
-	t.Context = &bi.ContextPath
 
 	bo := &build.Options{
 		Inputs:        bi,
@@ -1105,7 +1130,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(sshSpecs) == 0 && buildflags.IsGitSSH(contextPath) {
+	if len(sshSpecs) == 0 && (buildflags.IsGitSSH(bi.ContextPath) || (inp != nil && buildflags.IsGitSSH(inp.URL))) {
 		sshSpecs = append(sshSpecs, &controllerapi.SSH{ID: "default"})
 	}
 	sshAttachment, err := controllerapi.CreateSSH(sshSpecs)
@@ -1145,6 +1170,11 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	}
 	bo.Attests = controllerapi.CreateAttestations(attests)
 
+	bo.SourcePolicy, err = build.ReadSourcePolicy()
+	if err != nil {
+		return nil, err
+	}
+
 	return bo, nil
 }
 
@@ -1167,6 +1197,26 @@ func removeDupes(s []string) []string {
 		i++
 	}
 	return s[:i]
+}
+
+func removeAttestDupes(s []string) []string {
+	res := []string{}
+	m := map[string]int{}
+	for _, v := range s {
+		att, err := buildflags.ParseAttest(v)
+		if err != nil {
+			res = append(res, v)
+			continue
+		}
+
+		if i, ok := m[att.Type]; ok {
+			res[i] = v
+		} else {
+			m[att.Type] = len(res)
+			res = append(res, v)
+		}
+	}
+	return res
 }
 
 func parseOutputType(str string) string {

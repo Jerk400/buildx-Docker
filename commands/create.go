@@ -14,9 +14,11 @@ import (
 	"github.com/docker/buildx/driver"
 	k8sutil "github.com/docker/buildx/driver/kubernetes/util"
 	remoteutil "github.com/docker/buildx/driver/remote/util"
+	"github.com/docker/buildx/localstate"
 	"github.com/docker/buildx/store"
 	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/cobrautil"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/cli/cli"
@@ -170,6 +172,13 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 		if err := ng.Leave(in.nodeName); err != nil {
 			return err
 		}
+		ls, err := localstate.New(confutil.ConfigDir(dockerCli))
+		if err != nil {
+			return err
+		}
+		if err := ls.RemoveBuilderNode(ng.Name, in.nodeName); err != nil {
+			return err
+		}
 	} else {
 		switch {
 		case driverName == "kubernetes":
@@ -319,6 +328,7 @@ func createCmd(dockerCli command.Cli) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCreate(dockerCli, options, args)
 		},
+		ValidArgsFunction: completion.Disable,
 	}
 
 	flags := cmd.Flags()

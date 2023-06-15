@@ -3,11 +3,13 @@ syntax = "proto3";
 package buildx.controller.v1;
 
 import "github.com/moby/buildkit/api/services/control/control.proto";
+import "github.com/moby/buildkit/sourcepolicy/pb/policy.proto";
 
 option go_package = "pb";
 
 service Controller {
   rpc Build(BuildRequest) returns (BuildResponse);
+  rpc Inspect(InspectRequest) returns (InspectResponse);
   rpc Status(StatusRequest) returns (stream StatusResponse);
   rpc Input(stream InputMessage) returns (InputResponse);
   rpc Invoke(stream Message) returns (stream Message);
@@ -47,7 +49,7 @@ message BuildRequest {
 message BuildOptions {
   string ContextPath = 1;
   string DockerfileName = 2;
-  string PrintFunc = 3;
+  PrintFunc PrintFunc = 3;
   map<string, string> NamedContexts = 4;
 
   repeated string Allow = 5;
@@ -70,11 +72,11 @@ message BuildOptions {
   UlimitOpt Ulimits = 22;
 
   string Builder = 23;
-  string MetadataFile = 24;
-  bool NoCache = 25;
-  bool Pull = 26;
-  bool ExportPush = 27;
-  bool ExportLoad = 28;
+  bool NoCache = 24;
+  bool Pull = 25;
+  bool ExportPush = 26;
+  bool ExportLoad = 27;
+  moby.buildkit.v1.sourcepolicy.Policy SourcePolicy = 28;
 }
 
 message ExportEntry {
@@ -103,6 +105,19 @@ message Secret {
   string ID = 1;
   string FilePath = 2;
   string Env = 3;
+}
+
+message PrintFunc {
+	string Name = 1;
+	string Format = 2;
+}
+
+message InspectRequest {
+  string Ref = 1;
+}
+
+message InspectResponse {
+  BuildOptions Options = 1;
 }
 
 message UlimitOpt {
@@ -184,6 +199,7 @@ message InvokeConfig {
   bool NoCwd = 7; // Do not set cwd but use the image's default
   bool Tty = 8;
   bool Rollback = 9; // Kill all process in the container and recreate it.
+  bool Initial = 10; // Run container from the initial state of that stage (supported only on the failed step)
 }
 
 message FdMessage {

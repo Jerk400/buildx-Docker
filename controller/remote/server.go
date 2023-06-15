@@ -8,17 +8,18 @@ import (
 	"time"
 
 	"github.com/docker/buildx/build"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	"github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/controller/processes"
 	"github.com/docker/buildx/util/ioset"
+	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/version"
-	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
-type BuildFunc func(ctx context.Context, options *pb.BuildOptions, stdin io.Reader, statusChan chan *client.SolveStatus) (resp *client.SolveResponse, res *build.ResultContext, err error)
+type BuildFunc func(ctx context.Context, options *pb.BuildOptions, stdin io.Reader, progress progress.Writer) (resp *client.SolveResponse, res *build.ResultHandle, err error)
 
 func NewServer(buildFunc BuildFunc) *Server {
 	return &Server{
@@ -34,11 +35,12 @@ type Server struct {
 
 type session struct {
 	buildOnGoing atomic.Bool
-	statusChan   chan *client.SolveStatus
+	statusChan   chan *pb.StatusResponse
 	cancelBuild  func()
+	buildOptions *pb.BuildOptions
 	inputPipe    *io.PipeWriter
 
-	result *build.ResultContext
+	result *build.ResultHandle
 
 	processes *processes.Manager
 }
@@ -111,6 +113,9 @@ func (m *Server) Disconnect(ctx context.Context, req *pb.DisconnectRequest) (res
 			s.cancelBuild()
 		}
 		s.cancelRunningProcesses()
+		if s.result != nil {
+			s.result.Done()
+		}
 	}
 	delete(m.session, key)
 	m.sessionMu.Unlock()
@@ -130,6 +135,23 @@ func (m *Server) Close() error {
 	}
 	m.sessionMu.Unlock()
 	return nil
+}
+
+func (m *Server) Inspect(ctx context.Context, req *pb.InspectRequest) (*pb.InspectResponse, error) {
+	ref := req.Ref
+	if ref == "" {
+		return nil, errors.New("inspect: empty key")
+	}
+	var bo *pb.BuildOptions
+	m.sessionMu.Lock()
+	if s, ok := m.session[ref]; ok {
+		bo = s.buildOptions
+	} else {
+		m.sessionMu.Unlock()
+		return nil, errors.Errorf("inspect: unknown key %v", ref)
+	}
+	m.sessionMu.Unlock()
+	return &pb.InspectResponse{Options: bo}, nil
 }
 
 func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResponse, error) {
@@ -155,8 +177,9 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 		s = &session{}
 		s.buildOnGoing.Store(true)
 	}
+
 	s.processes = processes.NewManager()
-	statusChan := make(chan *client.SolveStatus)
+	statusChan := make(chan *pb.StatusResponse)
 	s.statusChan = statusChan
 	inR, inW := io.Pipe()
 	defer inR.Close()
@@ -174,27 +197,40 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 		m.sessionMu.Unlock()
 	}()
 
+	pw := pb.NewProgressWriter(statusChan)
+
 	// Build the specified request
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	resp, res, err := m.buildFunc(ctx, req.Options, inR, statusChan)
+	resp, res, buildErr := m.buildFunc(ctx, req.Options, inR, pw)
 	m.sessionMu.Lock()
 	if s, ok := m.session[ref]; ok {
-		s.result = res
-		s.cancelBuild = cancel
-		m.session[ref] = s
+		// NOTE: buildFunc can return *build.ResultHandle even on error (e.g. when it's implemented using (github.com/docker/buildx/controller/build).RunBuild).
+		if res != nil {
+			s.result = res
+			s.cancelBuild = cancel
+			s.buildOptions = req.Options
+			m.session[ref] = s
+			if buildErr != nil {
+				buildErr = controllererrors.WrapBuild(buildErr, ref)
+			}
+		}
 	} else {
 		m.sessionMu.Unlock()
 		return nil, errors.Errorf("build: unknown key %v", ref)
 	}
 	m.sessionMu.Unlock()
 
+	if buildErr != nil {
+		return nil, buildErr
+	}
+
 	if resp == nil {
 		resp = &client.SolveResponse{}
 	}
 	return &pb.BuildResponse{
 		ExporterResponse: resp.ExporterResponse,
-	}, err
+	}, nil
 }
 
 func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer) error {
@@ -204,7 +240,7 @@ func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer
 	}
 
 	// Wait and get status channel prepared by Build()
-	var statusChan <-chan *client.SolveStatus
+	var statusChan <-chan *pb.StatusResponse
 	for {
 		// TODO: timeout?
 		m.sessionMu.Lock()
@@ -223,8 +259,7 @@ func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer
 		if ss == nil {
 			break
 		}
-		cs := toControlStatus(ss)
-		if err := stream.Send(cs); err != nil {
+		if err := stream.Send(ss); err != nil {
 			return err
 		}
 	}
@@ -403,52 +438,4 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 	})
 
 	return eg.Wait()
-}
-
-func toControlStatus(s *client.SolveStatus) *pb.StatusResponse {
-	resp := pb.StatusResponse{}
-	for _, v := range s.Vertexes {
-		resp.Vertexes = append(resp.Vertexes, &controlapi.Vertex{
-			Digest:        v.Digest,
-			Inputs:        v.Inputs,
-			Name:          v.Name,
-			Started:       v.Started,
-			Completed:     v.Completed,
-			Error:         v.Error,
-			Cached:        v.Cached,
-			ProgressGroup: v.ProgressGroup,
-		})
-	}
-	for _, v := range s.Statuses {
-		resp.Statuses = append(resp.Statuses, &controlapi.VertexStatus{
-			ID:        v.ID,
-			Vertex:    v.Vertex,
-			Name:      v.Name,
-			Total:     v.Total,
-			Current:   v.Current,
-			Timestamp: v.Timestamp,
-			Started:   v.Started,
-			Completed: v.Completed,
-		})
-	}
-	for _, v := range s.Logs {
-		resp.Logs = append(resp.Logs, &controlapi.VertexLog{
-			Vertex:    v.Vertex,
-			Stream:    int64(v.Stream),
-			Msg:       v.Data,
-			Timestamp: v.Timestamp,
-		})
-	}
-	for _, v := range s.Warnings {
-		resp.Warnings = append(resp.Warnings, &controlapi.VertexWarning{
-			Vertex: v.Vertex,
-			Level:  int64(v.Level),
-			Short:  v.Short,
-			Detail: v.Detail,
-			Url:    v.URL,
-			Info:   v.SourceInfo,
-			Ranges: v.Range,
-		})
-	}
-	return &resp
 }

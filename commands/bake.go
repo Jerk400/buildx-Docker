@@ -6,18 +6,20 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/containerd/console"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/buildx/bake"
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/builder"
 	"github.com/docker/buildx/util/buildflags"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/dockerutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/buildkit/util/appcontext"
-	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -117,8 +119,13 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions, cFlags com
 		progressTextDesc = fmt.Sprintf("building with %q instance using %s driver", b.Name, b.Driver)
 	}
 
+	var term bool
+	if _, err := console.ConsoleFromFile(os.Stderr); err == nil {
+		term = true
+	}
+
 	printer, err := progress.NewPrinter(ctx2, os.Stderr, os.Stderr, cFlags.progress,
-		progressui.WithDesc(progressTextDesc, progressConsoleDesc),
+		progress.WithDesc(progressTextDesc, progressConsoleDesc),
 	)
 	if err != nil {
 		return err
@@ -130,13 +137,16 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions, cFlags com
 			if err == nil {
 				err = err1
 			}
+			if err == nil && cFlags.progress != progress.PrinterModeQuiet {
+				desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
+			}
 		}
 	}()
 
 	if url != "" {
 		files, inp, err = bake.ReadRemoteFiles(ctx, nodes, url, in.files, printer)
 	} else {
-		files, err = bake.ReadLocalFiles(in.files)
+		files, err = bake.ReadLocalFiles(in.files, dockerCli.In())
 	}
 	if err != nil {
 		return err
@@ -144,7 +154,7 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions, cFlags com
 
 	tgts, grps, err := bake.ReadTargets(ctx, files, targets, overrides, map[string]string{
 		// don't forget to update documentation if you add a new
-		// built-in variable: docs/manuals/bake/file-definition.md#built-in-variables
+		// built-in variable: docs/bake-reference.md#built-in-variables
 		"BAKE_CMD_CONTEXT":    cmdContext,
 		"BAKE_LOCAL_PLATFORM": platforms.DefaultString(),
 	})
@@ -230,6 +240,7 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			// Other common flags (noCache, pull and progress) are processed in runBake function.
 			return runBake(dockerCli, args, options, cFlags)
 		},
+		ValidArgsFunction: completion.BakeTargets(options.files),
 	}
 
 	flags := cmd.Flags()
