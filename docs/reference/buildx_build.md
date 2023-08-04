@@ -24,10 +24,10 @@ Start a build
 | [`--cache-from`](#cache-from)                                                                                                                          | `stringArray` |           | External cache sources (e.g., `user/app:cache`, `type=local,src=path/to/dir`)                       |
 | [`--cache-to`](#cache-to)                                                                                                                              | `stringArray` |           | Cache export destinations (e.g., `user/app:cache`, `type=local,dest=path/to/dir`)                   |
 | [`--cgroup-parent`](https://docs.docker.com/engine/reference/commandline/build/#cgroup-parent)                                                         | `string`      |           | Optional parent cgroup for the container                                                            |
-| `--detach`                                                                                                                                             |               |           | Detach buildx server (supported only on linux) [experimental]                                       |
+| `--detach`                                                                                                                                             |               |           | Detach buildx server (supported only on linux)                                                      |
 | [`-f`](https://docs.docker.com/engine/reference/commandline/build/#file), [`--file`](https://docs.docker.com/engine/reference/commandline/build/#file) | `string`      |           | Name of the Dockerfile (default: `PATH/Dockerfile`)                                                 |
 | `--iidfile`                                                                                                                                            | `string`      |           | Write the image ID to the file                                                                      |
-| `--invoke`                                                                                                                                             | `string`      |           | Invoke a command after the build [experimental]                                                     |
+| `--invoke`                                                                                                                                             | `string`      |           | Invoke a command after the build                                                                    |
 | `--label`                                                                                                                                              | `stringArray` |           | Set metadata for an image                                                                           |
 | [`--load`](#load)                                                                                                                                      |               |           | Shorthand for `--output=type=docker`                                                                |
 | [`--metadata-file`](#metadata-file)                                                                                                                    | `string`      |           | Write build result metadata to the file                                                             |
@@ -36,16 +36,16 @@ Start a build
 | `--no-cache-filter`                                                                                                                                    | `stringArray` |           | Do not cache specified stages                                                                       |
 | [`-o`](#output), [`--output`](#output)                                                                                                                 | `stringArray` |           | Output destination (format: `type=local,dest=path`)                                                 |
 | [`--platform`](#platform)                                                                                                                              | `stringArray` |           | Set target platform for build                                                                       |
-| `--print`                                                                                                                                              | `string`      |           | Print result of information request (e.g., outline, targets) [experimental]                         |
+| `--print`                                                                                                                                              | `string`      |           | Print result of information request (e.g., outline, targets)                                        |
 | [`--progress`](#progress)                                                                                                                              | `string`      | `auto`    | Set type of progress output (`auto`, `plain`, `tty`). Use plain to show container output            |
 | [`--provenance`](#provenance)                                                                                                                          | `string`      |           | Shorthand for `--attest=type=provenance`                                                            |
 | `--pull`                                                                                                                                               |               |           | Always attempt to pull all referenced images                                                        |
 | [`--push`](#push)                                                                                                                                      |               |           | Shorthand for `--output=type=registry`                                                              |
 | `-q`, `--quiet`                                                                                                                                        |               |           | Suppress the build output and print image ID on success                                             |
-| `--root`                                                                                                                                               | `string`      |           | Specify root directory of server to connect [experimental]                                          |
+| `--root`                                                                                                                                               | `string`      |           | Specify root directory of server to connect                                                         |
 | [`--sbom`](#sbom)                                                                                                                                      | `string`      |           | Shorthand for `--attest=type=sbom`                                                                  |
 | [`--secret`](#secret)                                                                                                                                  | `stringArray` |           | Secret to expose to the build (format: `id=mysecret[,src=/local/secret]`)                           |
-| `--server-config`                                                                                                                                      | `string`      |           | Specify buildx server config file (used only when launching new server) [experimental]              |
+| `--server-config`                                                                                                                                      | `string`      |           | Specify buildx server config file (used only when launching new server)                             |
 | [`--shm-size`](#shm-size)                                                                                                                              | `bytes`       | `0`       | Size of `/dev/shm`                                                                                  |
 | [`--ssh`](#ssh)                                                                                                                                        | `stringArray` |           | SSH agent socket or keys to expose to the build (format: `default\|<id>[=<socket>\|<key>[,<key>]]`) |
 | [`-t`](https://docs.docker.com/engine/reference/commandline/build/#tag), [`--tag`](https://docs.docker.com/engine/reference/commandline/build/#tag)    | `stringArray` |           | Name and optionally a tag (format: `name:tag`)                                                      |
@@ -125,7 +125,6 @@ Same as [`docker build` command](https://docs.docker.com/engine/reference/comman
 There are also useful built-in build args like:
 
 * `BUILDKIT_CONTEXT_KEEP_GIT_DIR=<bool>` trigger git context to keep the `.git` directory
-* `BUILDKIT_INLINE_BUILDINFO_ATTRS=<bool>` inline build info attributes in image config or not
 * `BUILDKIT_INLINE_CACHE=<bool>` inline cache metadata to image config or not
 * `BUILDKIT_MULTI_PLATFORM=<bool>` opt into deterministic output regardless of multi-platform output or not
 
@@ -286,26 +285,6 @@ $ cat metadata.json
 ```
 ```json
 {
-  "containerimage.buildinfo": {
-    "frontend": "dockerfile.v0",
-    "attrs": {
-      "context": "https://github.com/crazy-max/buildkit-buildsources-test.git#master",
-      "filename": "Dockerfile",
-      "source": "docker/dockerfile:master"
-    },
-    "sources": [
-      {
-        "type": "docker-image",
-        "ref": "docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0",
-        "pin": "sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0"
-      },
-      {
-        "type": "docker-image",
-        "ref": "docker.io/library/alpine:3.13",
-        "pin": "sha256:026f721af4cf2843e07bba648e158fb35ecc876d822130633cc49f707f0fc88c"
-      }
-    ]
-  },
   "containerimage.config.digest": "sha256:2937f66a9722f7f4a2df583de2f8cb97fc9196059a410e7f00072fc918930e66",
   "containerimage.descriptor": {
     "annotations": {

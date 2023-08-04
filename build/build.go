@@ -267,11 +267,11 @@ func resolveDriversBase(ctx context.Context, nodes []builder.Node, opt map[strin
 	}
 
 	undetectedPlatform := false
-	allPlatforms := map[string]int{}
+	allPlatforms := map[string]struct{}{}
 	for _, opt := range opt {
 		for _, p := range opt.Platforms {
 			k := platforms.Format(p)
-			allPlatforms[k] = -1
+			allPlatforms[k] = struct{}{}
 			if _, ok := availablePlatforms[k]; !ok {
 				undetectedPlatform = true
 			}
@@ -593,7 +593,10 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 	}
 
 	if opt.Pull {
-		so.FrontendAttrs["image-resolve-mode"] = "pull"
+		so.FrontendAttrs["image-resolve-mode"] = pb.AttrImageResolveModeForcePull
+	} else if nodeDriver.IsMobyDriver() {
+		// moby driver always resolves local images by default
+		so.FrontendAttrs["image-resolve-mode"] = pb.AttrImageResolveModePreferLocal
 	}
 	if opt.Target != "" {
 		so.FrontendAttrs["target"] = opt.Target
@@ -642,7 +645,7 @@ func toSolveOpt(ctx context.Context, node builder.Node, multiDriver bool, opt Op
 	}
 
 	// setup extrahosts
-	extraHosts, err := toBuildkitExtraHosts(opt.ExtraHosts, nodeDriver.IsMobyDriver())
+	extraHosts, err := toBuildkitExtraHosts(ctx, opt.ExtraHosts, nodeDriver)
 	if err != nil {
 		return nil, nil, err
 	}
