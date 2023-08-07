@@ -160,6 +160,7 @@ func NewResultHandle(ctx context.Context, cc *client.Client, opt client.SolveOpt
 		opt.Ref = ""
 		opt.Exports = nil
 		opt.CacheExports = nil
+		opt.Internal = true
 		_, respErr = cc.Build(ctx, opt, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
 			res, err := evalDefinition(ctx, c, def)
 			if err != nil {
@@ -387,7 +388,7 @@ func populateProcessConfigFromResult(req *gateway.StartRequest, res *gateway.Res
 	} else if img != nil {
 		args = append(args, img.Config.Entrypoint...)
 	}
-	if cfg.Cmd != nil {
+	if !cfg.NoCmd {
 		args = append(args, cfg.Cmd...)
 	} else if img != nil {
 		args = append(args, img.Config.Cmd...)

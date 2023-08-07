@@ -2,6 +2,7 @@ package workers
 
 import (
 	"context"
+	"os"
 	"os/exec"
 
 	"github.com/moby/buildkit/identity"
@@ -13,10 +14,15 @@ func InitDockerWorker() {
 	integration.Register(&dockerWorker{
 		id: "docker",
 	})
+	integration.Register(&dockerWorker{
+		id:                    "docker+containerd",
+		containerdSnapshotter: true,
+	})
 }
 
 type dockerWorker struct {
-	id string
+	id                    string
+	containerdSnapshotter bool
 }
 
 func (c dockerWorker) Name() string {
@@ -29,7 +35,8 @@ func (c dockerWorker) Rootless() bool {
 
 func (c dockerWorker) New(ctx context.Context, cfg *integration.BackendConfig) (b integration.Backend, cl func() error, err error) {
 	moby := integration.Moby{
-		ID: c.id,
+		ID:                    c.id,
+		ContainerdSnapshotter: c.containerdSnapshotter,
 	}
 	bk, bkclose, err := moby.New(ctx, cfg)
 	if err != nil {
@@ -41,8 +48,9 @@ func (c dockerWorker) New(ctx context.Context, cfg *integration.BackendConfig) (
 		name,
 		"--docker", "host="+bk.DockerAddress(),
 	)
+	cmd.Env = append(os.Environ(), "BUILDX_CONFIG=/tmp/buildx-"+name)
 	if err := cmd.Run(); err != nil {
-		return nil, cl, errors.Wrapf(err, "failed to create buildx instance %s", name)
+		return bk, cl, errors.Wrapf(err, "failed to create buildx instance %s", name)
 	}
 
 	cl = func() error {
@@ -61,4 +69,8 @@ func (c dockerWorker) New(ctx context.Context, cfg *integration.BackendConfig) (
 		builder: name,
 		context: name,
 	}, cl, nil
+}
+
+func (c dockerWorker) Close() error {
+	return nil
 }

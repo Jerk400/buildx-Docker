@@ -3,19 +3,23 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/creack/pty"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/testutil"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,6 +36,9 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildLocalExport,
 	testBuildRegistryExport,
 	testBuildTarExport,
+	testBuildMobyFromLocalImage,
+	testBuildDetailsLink,
+	testBuildProgress,
 }
 
 func testBuild(t *testing.T, sb integration.Sandbox) {
@@ -106,7 +113,7 @@ func testImageIDOutput(t *testing.T, sb integration.Sandbox) {
 
 	cmd := buildxCmd(
 		sb,
-		withArgs("build", "-q", outFlag, "--iidfile", filepath.Join(targetDir, "iid.txt"), "--metadata-file", filepath.Join(targetDir, "md.json"), dir),
+		withArgs("build", "-q", "--provenance", "false", outFlag, "--iidfile", filepath.Join(targetDir, "iid.txt"), "--metadata-file", filepath.Join(targetDir, "md.json"), dir),
 	)
 	stdout := bytes.NewBuffer(nil)
 	cmd.Stdout = stdout
@@ -139,6 +146,95 @@ func testImageIDOutput(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, dgst, digest.Digest(md.ConfigDigest))
 }
 
+func testBuildMobyFromLocalImage(t *testing.T, sb integration.Sandbox) {
+	if !isDockerWorker(sb) {
+		t.Skip("skipping test for non-docker workers")
+	}
+
+	// pull image
+	cmd := dockerCmd(sb, withArgs("pull", "-q", "busybox:latest"))
+	stdout := bytes.NewBuffer(nil)
+	cmd.Stdout = stdout
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+	require.Equal(t, "docker.io/library/busybox:latest", strings.TrimSpace(stdout.String()))
+
+	// create local tag
+	cmd = dockerCmd(sb, withArgs("tag", "busybox:latest", "buildx-test:busybox"))
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+
+	// build image
+	dockerfile := []byte(`FROM buildx-test:busybox`)
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	cmd = buildxCmd(
+		sb,
+		withArgs("build", "-q", "--output=type=cacheonly", dir),
+	)
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+
+	// create local tag matching a remote one
+	cmd = dockerCmd(sb, withArgs("tag", "busybox:latest", "busybox:1.36"))
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+
+	// build image and check that it uses the local tag
+	dockerfile = []byte(`
+FROM busybox:1.36
+RUN busybox | head -1 | grep v1.35.0
+`)
+	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	cmd = buildxCmd(
+		sb,
+		withArgs("build", "-q", "--output=type=cacheonly", dir),
+	)
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run())
+}
+
+func testBuildDetailsLink(t *testing.T, sb integration.Sandbox) {
+	buildDetailsPattern := regexp.MustCompile(`(?m)^View build details: docker-desktop://dashboard/build/[^/]+/[^/]+/[^/]+\n$`)
+
+	// build simple dockerfile
+	dockerfile := []byte(`FROM busybox:latest
+RUN echo foo > /bar`)
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	cmd := buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.False(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("build details link not expected in output, got %q", out))
+
+	// create desktop-build .lastaccess file
+	home, err := os.UserHomeDir() // TODO: sandbox should create a temp home dir and expose it through its interface
+	require.NoError(t, err)
+	dbDir := path.Join(home, ".docker", "desktop-build")
+	require.NoError(t, os.MkdirAll(dbDir, 0755))
+	dblaFile, err := os.Create(path.Join(dbDir, ".lastaccess"))
+	require.NoError(t, err)
+	defer func() {
+		dblaFile.Close()
+		if err := os.Remove(dblaFile.Name()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// build again
+	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
+	out, err = cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
+
+	// build erroneous dockerfile
+	dockerfile = []byte(`FROM busybox:latest
+RUN exit 1`)
+	dir = tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0600))
+	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
+	out, err = cmd.CombinedOutput()
+	require.Error(t, err, string(out))
+	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
+}
+
 func createTestProject(t *testing.T) string {
 	dockerfile := []byte(`
 FROM busybox:latest AS base
@@ -154,4 +250,30 @@ COPY --from=base /etc/bar /bar
 		fstest.CreateFile("foo", []byte("foo"), 0600),
 	)
 	return dir
+}
+
+func testBuildProgress(t *testing.T, sb integration.Sandbox) {
+	dir := createTestProject(t)
+	driver, _, _ := strings.Cut(sb.Name(), "+")
+	name := sb.Address()
+
+	// progress=tty
+	cmd := buildxCmd(sb, withArgs("build", "--progress=tty", "--output=type=cacheonly", dir))
+	f, err := pty.Start(cmd)
+	require.NoError(t, err)
+	buf := bytes.NewBuffer(nil)
+	io.Copy(buf, f)
+	ttyOutput := buf.String()
+	require.Contains(t, ttyOutput, "[+] Building")
+	require.Contains(t, ttyOutput, fmt.Sprintf("%s:%s", driver, name))
+	require.Contains(t, ttyOutput, "=> [internal] load build definition from Dockerfile")
+	require.Contains(t, ttyOutput, "=> [base 1/3] FROM docker.io/library/busybox:latest")
+
+	// progress=plain
+	cmd = buildxCmd(sb, withArgs("build", "--progress=plain", "--output=type=cacheonly", dir))
+	plainOutput, err := cmd.CombinedOutput()
+	require.NoError(t, err)
+	require.Contains(t, string(plainOutput), fmt.Sprintf(`#0 building with "%s" instance using %s driver`, name, driver))
+	require.Contains(t, string(plainOutput), "[internal] load build definition from Dockerfile")
+	require.Contains(t, string(plainOutput), "[base 1/3] FROM docker.io/library/busybox:latest")
 }
